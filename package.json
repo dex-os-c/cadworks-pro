@@ -1,0 +1,26 @@
+{
+  "name": "cadworks-pro",
+  "version": "1.0.0",
+  "description": "Professional 3D CAD Software - SolidWorks-inspired engineering design tool",
+  "type": "module",
+  "scripts": {
+    "dev": "node ./node_modules/vite/bin/vite.js --host 0.0.0.0",
+    "build": "node ./node_modules/vite/bin/vite.js build",
+    "preview": "node ./node_modules/vite/bin/vite.js preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "three": "^0.160.0",
+    "@react-three/fiber": "^8.15.0",
+    "@react-three/drei": "^9.88.0",
+    "zustand": "^4.4.7",
+    "lucide-react": "^0.294.0",
+    "file-saver": "^2.0.5",
+    "immer": "^10.0.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite": "^5.0.0"
+  }
+}

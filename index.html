@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#1e1e22" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>CADWorks Pro — Professional 3D CAD</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; touch-action: none; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #2d2d30; color: #f0f0f0; }
+    #loading-screen {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      z-index: 10000; transition: opacity 0.5s;
+    }
+    #loading-screen .logo { font-size: 48px; font-weight: 700; color: #4fc3f7; letter-spacing: 2px; }
+    #loading-screen .sub { font-size: 14px; color: #90a4ae; margin-top: 8px; }
+    #loading-screen .bar { width: 300px; height: 3px; background: #333; margin-top: 30px; border-radius: 2px; overflow: hidden; }
+    #loading-screen .bar-fill { width: 0%; height: 100%; background: linear-gradient(90deg, #4fc3f7, #29b6f6); animation: load 2s ease-in-out forwards; }
+    @keyframes load { to { width: 100%; } }
+  </style>
+</head>
+<body>
+  <div id="loading-screen">
+    <div class="logo">CADWorks Pro</div>
+    <div class="sub">Professional 3D CAD Engineering Suite</div>
+    <div class="bar"><div class="bar-fill"></div></div>
+  </div>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
