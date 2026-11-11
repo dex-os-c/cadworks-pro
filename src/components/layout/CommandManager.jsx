@@ -6,7 +6,8 @@ import {
   Layers, Copy, Scissors, Compass, Sliders, Play, CheckCircle2,
   XCircle, Square, Circle, PenTool, Hash, Info, FileSpreadsheet,
   Download, Eye, Grid, Scale, Menu, ChevronUp, ChevronDown,
-  Sparkles, Layers3, Cpu, FileText, Check, ArrowRight
+  Sparkles, Layers3, Cpu, FileText, Check, ArrowRight,
+  ArrowDownToLine, Move, Crosshair
 } from 'lucide-react';
 import { useCADStore } from '../../store/cadStore';
 import { TOOLS, FEATURE_TYPES } from '../../utils/constants';
@@ -597,6 +598,62 @@ export default function CommandManager({ onExportClick, onMaterialClick, onMassP
                     <Spline size={19} color="#fde047" />
                     <span>Parallel</span>
                   </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('perpendicular', assemblyComponents[0].id, 'top', assemblyComponents[1].id, 'front', 0);
+                    }}
+                    title="Perpendicular Mate (90° face normal orientation)"
+                  >
+                    <ArrowDownToLine size={19} color="#c084fc" />
+                    <span>Perpendic</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('tangent', assemblyComponents[0].id, 'cylinder', assemblyComponents[1].id, 'top', 0);
+                    }}
+                    title="Tangent Mate (Cylinder to planar surface contact)"
+                  >
+                    <Circle size={19} color="#f472b6" />
+                    <span>Tangent</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('width', assemblyComponents[0].id, 'tab', assemblyComponents[1].id, 'boundary', 0);
+                    }}
+                    title="Width Mate (Centers component between two boundary faces)"
+                  >
+                    <Maximize2 size={19} color="#34d399" />
+                    <span>Width</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 1) {
+                        alert('Please insert at least one component to mate to a path.');
+                        return;
+                      }
+                      addAssemblyMate('path', assemblyComponents[0].id, 'origin', 'path_curve', 'guide', 0);
+                    }}
+                    title="Path Mate (Restrains component along guide curve)"
+                  >
+                    <Spline size={19} color="#fbbf24" />
+                    <span>Path</span>
+                  </button>
                 </div>
                 <div className="tool-group-label">MATES</div>
               </div>
@@ -614,6 +671,14 @@ export default function CommandManager({ onExportClick, onMaterialClick, onMassP
                   </button>
                   <button
                     className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'exploded_view' })}
+                    title="Configure Exploded View"
+                  >
+                    <Move size={19} color="#38bdf8" />
+                    <span>Explode</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
                     onClick={clearAssembly}
                     title="Remove all components and mates"
                   >
@@ -626,8 +691,98 @@ export default function CommandManager({ onExportClick, onMaterialClick, onMassP
             </>
           )}
 
-          {/* SURFACES, SHEET METAL, DRAWING tabs */}
-          {(activeTab === 'Surfaces' || activeTab === 'Sheet Metal' || activeTab === 'Drawing') && (
+          {/* DRAWING TAB */}
+          {activeTab === 'Drawing' && (
+            <>
+              {/* VIEWS */}
+              <div className="tool-group">
+                <div className="tool-group-buttons">
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_view', viewType: 'standard_3_view' })}
+                    title="Insert Standard 3-View (Front, Top, Right)"
+                  >
+                    <Grid size={19} color="#38bdf8" />
+                    <span>Standard 3</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_view', viewType: 'projected' })}
+                    title="Projected Orthographic View"
+                  >
+                    <Box size={19} color="#4ade80" />
+                    <span>Projected</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_view', viewType: 'section' })}
+                    title="Cross-Section Cut View"
+                  >
+                    <Scissors size={19} color="#fb923c" />
+                    <span>Section</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_view', viewType: 'isometric' })}
+                    title="Isometric 3D Projected View"
+                  >
+                    <Layers size={19} color="#c084fc" />
+                    <span>Isometric</span>
+                  </button>
+                </div>
+                <div className="tool-group-label">VIEWS</div>
+              </div>
+
+              {/* ANNOTATIONS */}
+              <div className="tool-group">
+                <div className="tool-group-buttons">
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_dimension', dimType: 'smart' })}
+                    title="Smart Dimension (Linear, Radius, Diameter, Angle)"
+                  >
+                    <Scale size={19} color="#f97316" />
+                    <span>Dimension</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_gdt', gdtType: 'fcf' })}
+                    title="Feature Control Frame (Geometric Tolerance)"
+                  >
+                    <Shield size={19} color="#38bdf8" />
+                    <span>GD&T FCF</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => openPropertyPanel({ type: 'drawing_gdt', gdtType: 'datum' })}
+                    title="Datum Feature Symbol (A, B, C)"
+                  >
+                    <Crosshair size={19} color="#fbbf24" />
+                    <span>Datum</span>
+                  </button>
+                </div>
+                <div className="tool-group-label">ANNOTATIONS</div>
+              </div>
+
+              {/* EXPORT */}
+              <div className="tool-group">
+                <div className="tool-group-buttons">
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => onExportClick && onExportClick()}
+                    title="Export 2D Drawing to DXF / SVG"
+                  >
+                    <Download size={19} color="#4ade80" />
+                    <span>Export 2D</span>
+                  </button>
+                </div>
+                <div className="tool-group-label">EXPORT</div>
+              </div>
+            </>
+          )}
+
+          {/* SURFACES, SHEET METAL tabs */}
+          {(activeTab === 'Surfaces' || activeTab === 'Sheet Metal') && (
             <div className="tool-group">
               <div className="tool-group-buttons">
                 <button

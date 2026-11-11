@@ -153,6 +153,7 @@ export const CONSTRAINT_TYPES = {
   CONCENTRIC: 'concentric',
   COLINEAR: 'colinear',
   DIMENSION: 'dimension',
+  ANGLE: 'angle',
 };
 
 // Mate types for assembly
@@ -164,6 +165,8 @@ export const MATE_TYPES = {
   CONCENTRIC: 'concentric',
   DISTANCE: 'distance',
   ANGLE: 'angle',
+  WIDTH: 'width',
+  PATH: 'path',
 };
 
 // Material database

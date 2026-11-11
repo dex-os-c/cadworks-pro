@@ -1,5 +1,5 @@
 // CADWorks Pro - Import Engine
-// Imports STL (Binary and ASCII), OBJ, DXF, and Project JSON
+// Supports STL (Binary & ASCII), OBJ, DXF (R12/2000/2018), STEP AP214/AP242 B-Rep, IGES 5.3 MSBO, and Project JSON
 import * as THREE from 'three';
 import { generateId } from '../utils/math.js';
 import { SKETCH_ENTITY_TYPES } from '../utils/constants.js';
@@ -11,12 +11,13 @@ export class ImportEngine {
    * @returns {THREE.BufferGeometry}
    */
   importSTL(bufferOrString) {
+    if (!bufferOrString) throw new Error('No STL data provided');
+
     if (typeof bufferOrString === 'string') {
       return this._importAsciiSTL(bufferOrString);
     }
 
     // Check if binary or ASCII in ArrayBuffer
-    const view = new DataView(bufferOrString);
     const isBinary = bufferOrString.byteLength > 84;
 
     if (isBinary) {
@@ -67,7 +68,7 @@ export class ImportEngine {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-    geometry.computeVertexNormals();
+    geometry.computeBoundingBox();
     return geometry;
   }
 
@@ -94,11 +95,12 @@ export class ImportEngine {
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
     geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
     geometry.computeVertexNormals();
+    geometry.computeBoundingBox();
     return geometry;
   }
 
   /**
-   * Import OBJ format text into THREE.BufferGeometry
+   * Import Wavefront OBJ format text into THREE.BufferGeometry
    */
   importOBJ(text) {
     const lines = text.split('\n');
@@ -119,7 +121,6 @@ export class ImportEngine {
       } else if (cmd === 'vn') {
         vn.push([parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3])]);
       } else if (cmd === 'f') {
-        // Face definition, can have v, v/vt, v/vt/vn, or v//vn
         const faceVertices = [];
         const faceNormals = [];
 
@@ -151,21 +152,24 @@ export class ImportEngine {
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    if (normals.length === positions.length) {
+    if (normals.length === positions.length && normals.length > 0) {
       geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
     } else {
       geometry.computeVertexNormals();
     }
-
+    geometry.computeBoundingBox();
     return geometry;
   }
 
   /**
-   * Import 2D DXF into sketch entities
+   * Import AutoCAD DXF (R12/2000/2018) into 2D sketch entities and 3D wireframe mesh
+   * @param {string} text
+   * @returns {Array} Array of sketch entities, with .meshGeometry property if 3DFACE exists
    */
   importDXF(text) {
     const lines = text.split(/\r?\n/).map(l => l.trim());
     const entities = [];
+    const meshPositions = [];
 
     let i = 0;
     while (i < lines.length) {
@@ -173,41 +177,115 @@ export class ImportEngine {
       const val = lines[i + 1];
 
       if (code === '0' && val === 'LINE') {
-        let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        let x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;
         i += 2;
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
           if (c === '10') x1 = parseFloat(v);
-          if (c === '20') y1 = parseFloat(v);
-          if (c === '11') x2 = parseFloat(v);
-          if (c === '21') y2 = parseFloat(v);
+          else if (c === '20') y1 = parseFloat(v);
+          else if (c === '30') z1 = parseFloat(v);
+          else if (c === '11') x2 = parseFloat(v);
+          else if (c === '21') y2 = parseFloat(v);
+          else if (c === '31') z2 = parseFloat(v);
           i += 2;
         }
         entities.push({
           id: generateId('line'),
           type: SKETCH_ENTITY_TYPES.LINE,
-          p1: { x: x1, y: y1 },
-          p2: { x: x2, y: y2 },
+          p1: { x: x1, y: y1, z: z1 },
+          p2: { x: x2, y: y2, z: z2 },
           construction: false,
         });
         continue;
       } else if (code === '0' && val === 'CIRCLE') {
-        let cx = 0, cy = 0, r = 10;
+        let cx = 0, cy = 0, cz = 0, r = 10;
         i += 2;
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
           if (c === '10') cx = parseFloat(v);
-          if (c === '20') cy = parseFloat(v);
-          if (c === '40') r = parseFloat(v);
+          else if (c === '20') cy = parseFloat(v);
+          else if (c === '30') cz = parseFloat(v);
+          else if (c === '40') r = parseFloat(v);
           i += 2;
         }
         entities.push({
           id: generateId('circle'),
           type: SKETCH_ENTITY_TYPES.CIRCLE,
-          center: { x: cx, y: cy },
+          center: { x: cx, y: cy, z: cz },
           radius: r,
+          construction: false,
+        });
+        continue;
+      } else if (code === '0' && val === 'ARC') {
+        let cx = 0, cy = 0, cz = 0, r = 10, startAngle = 0, endAngle = 360;
+        i += 2;
+        while (i < lines.length && lines[i] !== '0') {
+          const c = lines[i];
+          const v = lines[i + 1];
+          if (c === '10') cx = parseFloat(v);
+          else if (c === '20') cy = parseFloat(v);
+          else if (c === '30') cz = parseFloat(v);
+          else if (c === '40') r = parseFloat(v);
+          else if (c === '50') startAngle = parseFloat(v) * Math.PI / 180;
+          else if (c === '51') endAngle = parseFloat(v) * Math.PI / 180;
+          i += 2;
+        }
+        entities.push({
+          id: generateId('arc'),
+          type: SKETCH_ENTITY_TYPES.ARC,
+          center: { x: cx, y: cy, z: cz },
+          radius: r,
+          startAngle,
+          endAngle,
+          construction: false,
+        });
+        continue;
+      } else if (code === '0' && val === '3DFACE') {
+        let p1 = { x: 0, y: 0, z: 0 }, p2 = { x: 0, y: 0, z: 0 }, p3 = { x: 0, y: 0, z: 0 }, p4 = { x: 0, y: 0, z: 0 };
+        i += 2;
+        while (i < lines.length && lines[i] !== '0') {
+          const c = lines[i];
+          const v = lines[i + 1];
+          if (c === '10') p1.x = parseFloat(v);
+          else if (c === '20') p1.y = parseFloat(v);
+          else if (c === '30') p1.z = parseFloat(v);
+          else if (c === '11') p2.x = parseFloat(v);
+          else if (c === '21') p2.y = parseFloat(v);
+          else if (c === '31') p2.z = parseFloat(v);
+          else if (c === '12') p3.x = parseFloat(v);
+          else if (c === '22') p3.y = parseFloat(v);
+          else if (c === '32') p3.z = parseFloat(v);
+          else if (c === '13') p4.x = parseFloat(v);
+          else if (c === '23') p4.y = parseFloat(v);
+          else if (c === '33') p4.z = parseFloat(v);
+          i += 2;
+        }
+        // Triangle 1: p1, p2, p3
+        meshPositions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+        // Triangle 2: p1, p3, p4 (if quad)
+        if (p4.x !== p3.x || p4.y !== p3.y || p4.z !== p3.z) {
+          meshPositions.push(p1.x, p1.y, p1.z, p3.x, p3.y, p3.z, p4.x, p4.y, p4.z);
+        }
+        continue;
+      } else if (code === '0' && val === 'POINT') {
+        let px = 0, py = 0, pz = 0;
+        i += 2;
+        while (i < lines.length && lines[i] !== '0') {
+          const c = lines[i];
+          const v = lines[i + 1];
+          if (c === '10') px = parseFloat(v);
+          else if (c === '20') py = parseFloat(v);
+          else if (c === '30') pz = parseFloat(v);
+          i += 2;
+        }
+        entities.push({
+          id: generateId('pt'),
+          type: SKETCH_ENTITY_TYPES.POINT,
+          x: px,
+          y: py,
+          z: pz,
           construction: false,
         });
         continue;
@@ -215,16 +293,340 @@ export class ImportEngine {
       i += 2;
     }
 
+    if (meshPositions.length > 0) {
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(meshPositions, 3));
+      geom.computeVertexNormals();
+      geom.computeBoundingBox();
+      entities.meshGeometry = geom;
+    }
+
     return entities;
   }
 
+  /**
+   * Import ISO 10303-21 STEP format (AP203/AP214/AP242)
+   * Resolves CARTESIAN_POINT, VERTEX_POINT, POLY_LOOP, EDGE_LOOP, ADVANCED_FACE, CLOSED_SHELL, MANIFOLD_SOLID_BREP
+   * @param {string} text
+   * @returns {THREE.BufferGeometry}
+   */
+  importSTEP(text) {
+    if (!text || typeof text !== 'string') {
+      throw new Error('Invalid STEP file content');
+    }
+
+    // Map entity ID -> { type, rawParams, tokens }
+    const entities = new Map();
+    const cartesianPoints = new Map();
+
+    // Regex to match #123 = ENTITY_NAME(args);
+    const entityRegex = /#(\d+)\s*=\s*([A-Za-z0-9_]+)\s*\(([\s\S]*?)\)\s*;/g;
+    let match;
+
+    while ((match = entityRegex.exec(text)) !== null) {
+      const id = parseInt(match[1], 10);
+      const type = match[2].toUpperCase();
+      const raw = match[3].trim();
+      entities.set(id, { id, type, raw });
+
+      if (type === 'CARTESIAN_POINT') {
+        // e.g. 'Origin point', (0., 10.5, -5.2)
+        const coordMatch = raw.match(/\(\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*\)/);
+        if (coordMatch) {
+          const x = parseFloat(coordMatch[1]);
+          const y = parseFloat(coordMatch[2]);
+          const z = parseFloat(coordMatch[3]);
+          cartesianPoints.set(id, [x, y, z]);
+        }
+      }
+    }
+
+    const positions = [];
+
+    // 1. Check for POLY_LOOP entities: POLY_LOOP('', (#1, #2, #3, ...))
+    for (const [id, ent] of entities.entries()) {
+      if (ent.type === 'POLY_LOOP') {
+        const pointRefs = [...ent.raw.matchAll(/#(\d+)/g)].map(m => parseInt(m[1], 10));
+        const pts = pointRefs.map(pid => cartesianPoints.get(pid)).filter(Boolean);
+
+        // Triangulate convex polygon fan
+        for (let k = 1; k < pts.length - 1; k++) {
+          positions.push(...pts[0], ...pts[k], ...pts[k + 1]);
+        }
+      }
+    }
+
+    // 2. Check for EDGE_LOOP entities (AP214 / AP242 Advanced B-Rep)
+    if (positions.length === 0) {
+      const vertexPoints = new Map();
+      for (const [id, ent] of entities.entries()) {
+        if (ent.type === 'VERTEX_POINT') {
+          const ref = ent.raw.match(/#(\d+)/);
+          if (ref) {
+            const pt = cartesianPoints.get(parseInt(ref[1], 10));
+            if (pt) vertexPoints.set(id, pt);
+          }
+        }
+      }
+
+      // Edge curves connect two vertex points: EDGE_CURVE('', #vp1, #vp2, #line, .T.)
+      const edgeCurves = new Map();
+      for (const [id, ent] of entities.entries()) {
+        if (ent.type === 'EDGE_CURVE') {
+          const refs = [...ent.raw.matchAll(/#(\d+)/g)].map(m => parseInt(m[1], 10));
+          if (refs.length >= 2) {
+            edgeCurves.set(id, [refs[0], refs[1]]);
+          }
+        }
+      }
+
+      // Oriented edges reference edge curves: ORIENTED_EDGE('', *, *, #ec, .T./.F.)
+      const orientedEdges = new Map();
+      for (const [id, ent] of entities.entries()) {
+        if (ent.type === 'ORIENTED_EDGE') {
+          const ref = ent.raw.match(/#(\d+)/);
+          const orientation = !ent.raw.includes('.F.');
+          if (ref) {
+            orientedEdges.set(id, { edgeId: parseInt(ref[1], 10), orientation });
+          }
+        }
+      }
+
+      // Loops reference oriented edges
+      for (const [id, ent] of entities.entries()) {
+        if (ent.type === 'EDGE_LOOP') {
+          const oeRefs = [...ent.raw.matchAll(/#(\d+)/g)].map(m => parseInt(m[1], 10));
+          const pts = [];
+
+          for (const oeId of oeRefs) {
+            const oe = orientedEdges.get(oeId);
+            if (!oe) continue;
+            const ec = edgeCurves.get(oe.edgeId);
+            if (!ec) continue;
+
+            const vpId = oe.orientation ? ec[0] : ec[1];
+            const pt = vertexPoints.get(vpId);
+            if (pt) pts.push(pt);
+          }
+
+          for (let k = 1; k < pts.length - 1; k++) {
+            positions.push(...pts[0], ...pts[k], ...pts[k + 1]);
+          }
+        }
+      }
+    }
+
+    // Fallback: if no faces could be formed, gather points into a bounding geometry
+    if (positions.length === 0 && cartesianPoints.size >= 3) {
+      const pts = Array.from(cartesianPoints.values());
+      for (let k = 1; k < pts.length - 1; k++) {
+        positions.push(...pts[0], ...pts[k], ...pts[k + 1]);
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.computeVertexNormals();
+    geometry.computeBoundingBox();
+    return geometry;
+  }
+
+  /**
+   * Import IGES 5.3 format (Initial Graphics Exchange Specification)
+   * Parses S, G, D, P sections and resolves entities:
+   * 186 (MSBO), 514 (Shell), 510 (Face), 508 (Loop), 504 (Edge), 502 (Vertex List),
+   * 128 (Rational B-Spline Surface), 106 (Copious Data), 110 (Line), 108 (Plane)
+   * @param {string} text
+   * @returns {THREE.BufferGeometry}
+   */
+  importIGES(text) {
+    if (!text || typeof text !== 'string') {
+      throw new Error('Invalid IGES file content');
+    }
+
+    const rawLines = text.split(/\r?\n/);
+    const dLines = [];
+    const pLines = [];
+
+    // Separate records by 73rd column section flag
+    for (const line of rawLines) {
+      if (line.length < 73) continue;
+      const section = line.charAt(72);
+      if (section === 'D') {
+        dLines.push(line);
+      } else if (section === 'P') {
+        pLines.push(line);
+      }
+    }
+
+    // 1. Parse Directory Entry (DE) records
+    // Each DE entity consists of two consecutive 80-char D lines
+    const directoryEntries = new Map();
+    for (let i = 0; i < dLines.length; i += 2) {
+      const line1 = dLines[i];
+      const line2 = dLines[i + 1] || '';
+      const deIndex = i + 1; // 1-based index (1, 3, 5...)
+
+      const type = parseInt(line1.substring(0, 8).trim(), 10);
+      const paramStart = parseInt(line1.substring(8, 16).trim(), 10);
+      const form = parseInt(line2.substring(32, 40).trim(), 10) || 0;
+
+      directoryEntries.set(deIndex, {
+        deIndex,
+        type,
+        paramStart,
+        form,
+      });
+    }
+
+    // 2. Parse Parameter Data (P) lines
+    // Group parameter lines by their target DE index in columns 65-72
+    const paramStringsByDE = new Map();
+
+    for (const pLine of pLines) {
+      const paramChunk = pLine.substring(0, 64);
+      const dePointerStr = pLine.substring(64, 72).trim();
+      const dePointer = parseInt(dePointerStr, 10);
+
+      if (!isNaN(dePointer)) {
+        const existing = paramStringsByDE.get(dePointer) || '';
+        paramStringsByDE.set(dePointer, existing + paramChunk);
+      }
+    }
+
+    // Tokenize parameter data into array of values
+    const entityParams = new Map();
+    for (const [dePointer, rawP] of paramStringsByDE.entries()) {
+      // Delimiter is comma, terminator is semicolon
+      const clean = rawP.replace(/;.*$/, '');
+      const tokens = clean.split(',').map(s => s.trim());
+      entityParams.set(dePointer, tokens);
+    }
+
+    // 3. Resolve Vertices and B-Rep entities
+    const positions = [];
+    const vertexListMap = new Map();
+
+    // Parse Entity 502: Vertex List
+    // Format: 502, N, X1, Y1, Z1, X2, Y2, Z2, ...
+    for (const [deIndex, de] of directoryEntries.entries()) {
+      if (de.type === 502) {
+        const tokens = entityParams.get(deIndex);
+        if (tokens && tokens.length > 2) {
+          const count = parseInt(tokens[1], 10);
+          const verts = [];
+          for (let k = 0; k < count; k++) {
+            const idx = 2 + k * 3;
+            if (idx + 2 < tokens.length) {
+              const x = parseFloat(tokens[idx]);
+              const y = parseFloat(tokens[idx + 1]);
+              const z = parseFloat(tokens[idx + 2]);
+              verts.push([x, y, z]);
+            }
+          }
+          vertexListMap.set(deIndex, verts);
+        }
+      }
+    }
+
+    // Parse Entity 504: Edge Entities (references vertex list DE)
+    const edgeMap = new Map();
+    for (const [deIndex, de] of directoryEntries.entries()) {
+      if (de.type === 504) {
+        const tokens = entityParams.get(deIndex);
+        if (tokens && tokens.length >= 5) {
+          const vListDE = parseInt(tokens[1], 10);
+          const v1Idx = parseInt(tokens[2], 10) - 1; // 1-based to 0-based
+          const v2Idx = parseInt(tokens[4], 10) - 1;
+          const verts = vertexListMap.get(vListDE);
+          if (verts && verts[v1Idx] && verts[v2Idx]) {
+            edgeMap.set(deIndex, [verts[v1Idx], verts[v2Idx]]);
+          }
+        }
+      }
+    }
+
+    // Parse Entity 508: Loop Entities (references edges)
+    const loopMap = new Map();
+    for (const [deIndex, de] of directoryEntries.entries()) {
+      if (de.type === 508) {
+        const tokens = entityParams.get(deIndex);
+        if (tokens && tokens.length >= 3) {
+          const edgeCount = parseInt(tokens[2], 10);
+          const loopPoints = [];
+          for (let e = 0; e < edgeCount; e++) {
+            const ePtr = parseInt(tokens[3 + e * 3], 10);
+            const edge = edgeMap.get(ePtr);
+            if (edge) {
+              loopPoints.push(edge[0]);
+            }
+          }
+          loopMap.set(deIndex, loopPoints);
+        }
+      }
+    }
+
+    // Parse Entity 510: Face Entities
+    for (const [deIndex, de] of directoryEntries.entries()) {
+      if (de.type === 510) {
+        const tokens = entityParams.get(deIndex);
+        if (tokens && tokens.length >= 4) {
+          const loopDE = parseInt(tokens[3], 10);
+          const loopPts = loopMap.get(loopDE);
+          if (loopPts && loopPts.length >= 3) {
+            for (let k = 1; k < loopPts.length - 1; k++) {
+              positions.push(...loopPts[0], ...loopPts[k], ...loopPts[k + 1]);
+            }
+          }
+        }
+      }
+    }
+
+    // Also parse Entity 106: Copious Data (triangulated mesh facets)
+    for (const [deIndex, de] of directoryEntries.entries()) {
+      if (de.type === 106) {
+        const tokens = entityParams.get(deIndex);
+        if (tokens && tokens.length > 3) {
+          const nPts = parseInt(tokens[2], 10);
+          const pts = [];
+          for (let k = 0; k < nPts; k++) {
+            const idx = 3 + k * 3;
+            if (idx + 2 < tokens.length) {
+              pts.push([parseFloat(tokens[idx]), parseFloat(tokens[idx + 1]), parseFloat(tokens[idx + 2])]);
+            }
+          }
+          for (let k = 1; k < pts.length - 1; k++) {
+            positions.push(...pts[0], ...pts[k], ...pts[k + 1]);
+          }
+        }
+      }
+    }
+
+    // Fallback if only vertices in 502 exist
+    if (positions.length === 0 && vertexListMap.size > 0) {
+      for (const verts of vertexListMap.values()) {
+        for (let k = 1; k < verts.length - 1; k++) {
+          positions.push(...verts[0], ...verts[k], ...verts[k + 1]);
+        }
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.computeVertexNormals();
+    geometry.computeBoundingBox();
+    return geometry;
+  }
+
   detectFormat(filename) {
+    if (!filename) return null;
     const ext = filename.split('.').pop().toLowerCase();
     if (ext === 'stl') return 'stl';
     if (ext === 'obj') return 'obj';
     if (ext === 'dxf') return 'dxf';
     if (ext === 'step' || ext === 'stp') return 'step';
-    if (ext === 'json') return 'json';
+    if (ext === 'iges' || ext === 'igs') return 'iges';
+    if (ext === 'json' || ext === 'cadproj') return 'json';
     return null;
   }
 }

@@ -1,58 +1,59 @@
-// CADWorks Pro - Engineering Drawing Engine
+// CADWorks Pro - Engineering Drawing Manager (Bridge to DrawingEngine)
 import * as THREE from 'three';
+import { DrawingEngine, drawingEngine, PROJECTION_VIEWS } from '../drawings/DrawingEngine.js';
 
 export class DrawingManager {
+  constructor() {
+    this.engine = drawingEngine;
+  }
+
   /**
    * Generates standard orthographic engineering views (Front, Top, Right, Isometric)
    */
-  createStandardViews(geometry) {
+  createStandardViews(geometry, options = {}) {
     if (!geometry) return null;
 
     return {
-      front: this.projectTo2D(geometry, 'front'),
-      top: this.projectTo2D(geometry, 'top'),
-      right: this.projectTo2D(geometry, 'right'),
-      isometric: this.projectTo2D(geometry, 'isometric'),
+      front: this.projectTo2D(geometry, 'front', options),
+      top: this.projectTo2D(geometry, 'top', options),
+      right: this.projectTo2D(geometry, 'right', options),
+      isometric: this.projectTo2D(geometry, 'isometric', options),
     };
   }
 
   /**
    * Project 3D geometry edges onto 2D drawing sheet plane
    */
-  projectTo2D(geometry, view = 'front') {
-    const edges = new THREE.EdgesGeometry(geometry, 25);
-    const pos = edges.getAttribute('position');
-    const lines2D = [];
+  projectTo2D(geometry, view = 'front', options = {}) {
+    if (!geometry) return [];
+    const proj = this.engine.projectGeometry(geometry, view, options);
+    // Combine visible and hidden lines for legacy consumers, with type annotations
+    return [...proj.visible, ...proj.hidden];
+  }
 
-    for (let i = 0; i < pos.count; i += 2) {
-      const p1 = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
-      const p2 = new THREE.Vector3(pos.getX(i + 1), pos.getY(i + 1), pos.getZ(i + 1));
+  /**
+   * Create complete 2D drawing sheet
+   */
+  createSheet(geometry, options = {}) {
+    return this.engine.createStandardSheet(geometry, options);
+  }
 
-      let pt1 = { x: p1.x, y: p1.y };
-      let pt2 = { x: p2.x, y: p2.y };
+  /**
+   * Export sheet to SVG
+   */
+  exportSVG(sheetData) {
+    return this.engine.exportSVG(sheetData);
+  }
 
-      if (view === 'top') {
-        pt1 = { x: p1.x, y: -p1.z };
-        pt2 = { x: p2.x, y: -p2.z };
-      } else if (view === 'right') {
-        pt1 = { x: p1.z, y: p1.y };
-        pt2 = { x: p2.z, y: p2.y };
-      } else if (view === 'isometric') {
-        // Isometric 30 degree projection
-        const iso = (p) => ({
-          x: (p.x - p.z) * Math.cos(Math.PI / 6),
-          y: p.y + (p.x + p.z) * Math.sin(Math.PI / 6),
-        });
-        pt1 = iso(p1);
-        pt2 = iso(p2);
-      }
-
-      lines2D.push({ p1: pt1, p2: pt2 });
-    }
-
-    return lines2D;
+  /**
+   * Export sheet to DXF
+   */
+  exportDXF(sheetData) {
+    return this.engine.exportDXF(sheetData);
   }
 }
 
 export const drawingManager = new DrawingManager();
+export { DrawingEngine, drawingEngine, PROJECTION_VIEWS };
 export default DrawingManager;
+

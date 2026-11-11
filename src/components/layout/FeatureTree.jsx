@@ -49,12 +49,26 @@ export default function FeatureTree({ onMaterialClick, isOpen, onClose }) {
   };
 
   const handleDoubleClick = (feat, index) => {
+    // Edit-in-context: ensure rollback bar allows editing this feature without desync
+    if (rollbackIndex >= 0 && index > rollbackIndex) {
+      setRollbackIndex(index);
+    }
     setActiveFeature(index);
     if (feat.type === FEATURE_TYPES.SKETCH) {
       editSketch(feat.id);
     } else {
       openPropertyPanel({ ...feat, isEditing: true });
     }
+  };
+
+  const getDependencyInfo = (feat) => {
+    const parents = (feat.parentIds || [])
+      .map(pid => features.find(f => f.id === pid)?.name)
+      .filter(Boolean);
+    const children = (feat.childIds || [])
+      .map(cid => features.find(f => f.id === cid)?.name)
+      .filter(Boolean);
+    return { parents, children };
   };
 
   const isRolledBack = (index) => {
@@ -167,6 +181,7 @@ export default function FeatureTree({ onMaterialClick, isOpen, onClose }) {
           const isSelected = activeFeatureIndex === index;
           const rolledBack = isRolledBack(index);
           const err = rebuildErrors?.find(e => e.featureId === feat.id);
+          const deps = getDependencyInfo(feat);
 
           return (
             <React.Fragment key={feat.id}>
@@ -180,7 +195,7 @@ export default function FeatureTree({ onMaterialClick, isOpen, onClose }) {
                   borderLeft: isSelected ? '3px solid #38bdf8' : '3px solid transparent',
                   cursor: 'pointer',
                 }}
-                title={rolledBack ? 'Feature is rolled back (inactive)' : (feat.suppressed ? 'Feature is suppressed' : 'Double-click to edit')}
+                title={rolledBack ? 'Feature is rolled back (inactive)' : (feat.suppressed ? 'Feature is suppressed' : `Double-click to edit. ${deps.parents.length ? 'Depends on: ' + deps.parents.join(', ') : ''}`)}
               >
                 <div className="tree-icon-badge" style={{ background: `${badge.color}20` }}>
                   {badge.icon}
@@ -202,6 +217,7 @@ export default function FeatureTree({ onMaterialClick, isOpen, onClose }) {
                   {feat.name || feat.type}
                   {feat.suppressed && <span style={{ fontSize: 9, color: '#f87171', padding: '1px 4px', background: 'rgba(248,113,113,0.1)', borderRadius: 3 }}>[Suppressed]</span>}
                   {rolledBack && <span style={{ fontSize: 9, color: '#a1a1aa', padding: '1px 4px', background: 'rgba(161,161,170,0.1)', borderRadius: 3 }}>[Rolled Back]</span>}
+                  {isSelected && deps.parents.length > 0 && <span style={{ fontSize: 9, color: '#38bdf8', padding: '1px 4px', background: 'rgba(56,189,248,0.1)', borderRadius: 3 }}>↑ {deps.parents[0]}</span>}
                 </span>
 
                 {/* Error warning badge if rebuild failed */}

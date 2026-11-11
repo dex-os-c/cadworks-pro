@@ -4,6 +4,44 @@
 
 import * as THREE from 'three';
 import { EPSILON, vec3, generateId } from '../utils/math.js';
+import {
+  Vertex,
+  Edge,
+  CoEdge,
+  Loop,
+  Face,
+  Shell,
+  SolidBody,
+  Curve,
+  LineCurve,
+  ArcCurve,
+  NurbsCurve,
+  Surface,
+  PlaneSurface,
+  CylinderSurface,
+  ConeSurface,
+  TorusSurface,
+  SphereSurface,
+  CURVE_TYPES,
+  SURFACE_TYPES,
+} from './Topology.js';
+import {
+  createSolidBox,
+  createSolidCylinder,
+  extrudeSolid,
+  revolveSolid,
+  sweepSolid,
+  loftSolid,
+  filletSolid,
+  chamferSolid,
+  shellSolid,
+  booleanUnion as brepBooleanUnion,
+  booleanSubtract as brepBooleanSubtract,
+  booleanIntersect as brepBooleanIntersect,
+  solidToBufferGeometry,
+  bufferGeometryToSolid,
+  extractBRepEdges,
+} from './BRep.js';
 
 // ============================================================================
 // BSP-Tree CSG Implementation
@@ -1204,6 +1242,10 @@ class GeometryEngine {
    * @returns {Object} - { volume, surfaceArea, mass, centerOfMass, momentOfInertia }
    */
   computeMassProperties(geometry, material = { density: 7900 }) {
+    if (!geometry) return null;
+    if (geometry instanceof SolidBody) {
+      return geometry.computeMassProperties(material?.density || 7900);
+    }
     const posAttr = geometry.getAttribute('position');
     const indexAttr = geometry.index;
 
@@ -2009,7 +2051,155 @@ class GeometryEngine {
       : (arc.endAngle ?? Math.PI * 2);
     return { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
   }
+
+  // ==========================================================================
+  // B-Rep Topology and Modeling Operations
+  // ==========================================================================
+
+  /**
+   * Convert a B-Rep SolidBody to Three.js BufferGeometry
+   */
+  solidToBufferGeometry(solidBody, options = {}) {
+    return solidToBufferGeometry(solidBody, options);
+  }
+
+  /**
+   * Convert a Three.js BufferGeometry to a topological B-Rep SolidBody
+   */
+  bufferGeometryToSolid(geometry, options = {}) {
+    return bufferGeometryToSolid(geometry, options);
+  }
+
+  /**
+   * Create a rectangular B-Rep SolidBody box
+   */
+  createBRepBox(dx = 20, dy = 20, dz = 20, center = new THREE.Vector3(0, 0, 0)) {
+    return createSolidBox(dx, dy, dz, center);
+  }
+
+  /**
+   * Create a cylindrical B-Rep SolidBody
+   */
+  createBRepCylinder(radius = 10, height = 30, segments = 32, center = new THREE.Vector3(0, 0, 0)) {
+    return createSolidCylinder(radius, height, segments, center);
+  }
+
+  /**
+   * Extrude a 2D profile / shape into a closed topological B-Rep SolidBody
+   */
+  extrudeBRep(pointsOrShape, depth = 20, direction = new THREE.Vector3(0, 0, 1), options = {}) {
+    return extrudeSolid(pointsOrShape, depth, direction, options);
+  }
+
+  /**
+   * Revolve a 2D profile / shape into a B-Rep SolidBody (full 360 or partial)
+   */
+  revolveBRep(pointsOrShape, axis = new THREE.Vector3(0, 1, 0), angle = Math.PI * 2, options = {}) {
+    return revolveSolid(pointsOrShape, axis, angle, options);
+  }
+
+  /**
+   * Sweep a 2D profile along a 3D path into a B-Rep SolidBody
+   */
+  sweepBRep(profileOrShape, pathOrPoints, options = {}) {
+    return sweepSolid(profileOrShape, pathOrPoints, options);
+  }
+
+  /**
+   * Loft multiple 2D/3D profile cross-sections into a B-Rep SolidBody
+   */
+  loftBRep(profilesOrShapes, options = {}) {
+    return loftSolid(profilesOrShapes, options);
+  }
+
+  /**
+   * Fillet B-Rep solid edges
+   */
+  filletBRep(solidBody, targetEdgeIndices = [], radius = 2, options = {}) {
+    return filletSolid(solidBody, targetEdgeIndices, radius, options);
+  }
+
+  /**
+   * Chamfer B-Rep solid edges
+   */
+  chamferBRep(solidBody, targetEdgeIndices = [], distance = 2, options = {}) {
+    return chamferSolid(solidBody, targetEdgeIndices, distance, options);
+  }
+
+  /**
+   * Shell B-Rep solid with uniform wall thickness
+   */
+  shellBRep(solidBody, thickness = 2, excludeFaceIds = [], options = {}) {
+    return shellSolid(solidBody, thickness, excludeFaceIds, options);
+  }
+
+  /**
+   * B-Rep Boolean Union
+   */
+  booleanUnionBRep(solidA, solidB) {
+    return brepBooleanUnion(solidA, solidB);
+  }
+
+  /**
+   * B-Rep Boolean Difference
+   */
+  booleanSubtractBRep(solidA, solidB) {
+    return brepBooleanSubtract(solidA, solidB);
+  }
+
+  /**
+   * B-Rep Boolean Intersection
+   */
+  booleanIntersectBRep(solidA, solidB) {
+    return brepBooleanIntersect(solidA, solidB);
+  }
+
+  /**
+   * Extract B-Rep feature edges
+   */
+  extractBRepEdges(solidOrGeom, featureAngleDeg = 25) {
+    const solid = solidOrGeom instanceof SolidBody ? solidOrGeom : bufferGeometryToSolid(solidOrGeom);
+    return extractBRepEdges(solid, featureAngleDeg);
+  }
 }
+
+// Re-export Topology and B-Rep classes and functions
+export {
+  Vertex,
+  Edge,
+  CoEdge,
+  Loop,
+  Face,
+  Shell,
+  SolidBody,
+  Curve,
+  LineCurve,
+  ArcCurve,
+  NurbsCurve,
+  Surface,
+  PlaneSurface,
+  CylinderSurface,
+  ConeSurface,
+  TorusSurface,
+  SphereSurface,
+  CURVE_TYPES,
+  SURFACE_TYPES,
+} from './Topology.js';
+
+export {
+  createSolidBox,
+  createSolidCylinder,
+  extrudeSolid,
+  revolveSolid,
+  sweepSolid,
+  loftSolid,
+  filletSolid,
+  chamferSolid,
+  shellSolid,
+  solidToBufferGeometry,
+  bufferGeometryToSolid,
+  extractBRepEdges,
+} from './BRep.js';
 
 // Export singleton instance
 export const geometryEngine = new GeometryEngine();

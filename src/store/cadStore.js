@@ -571,6 +571,8 @@ export const useCADStore = create(
       }
 
       const comp = assemblyManager.insertComponent(name || `Part_${state.assemblyComponents.length + 1}`, geom);
+      comp.geometryType = shapeType;
+      comp.dimensions = { ...dims };
       if (state.assemblyComponents.length > 0) {
         // Offset subsequent components slightly so they don't visually overlap initially
         comp.position.x = state.assemblyComponents.length * 35;
@@ -580,15 +582,26 @@ export const useCADStore = create(
       state.statusMessage = `Inserted "${comp.name}" into assembly`;
     }),
 
-    addAssemblyMate: (type, comp1Id, ref1, comp2Id, ref2, offset = 0) => set(state => {
+    addAssemblyMate: (type, comp1Id, ref1, comp2Id, ref2, offset = 0, extra = {}) => set(state => {
       const mate = assemblyManager.addMate(type, comp1Id, ref1, comp2Id, ref2, offset);
+      if (extra && typeof extra === 'object') {
+        Object.assign(mate, extra);
+      }
       state.mates = [...assemblyManager.mates];
       state.assemblyComponents = [...assemblyManager.components];
       state.statusMessage = `Added ${type} mate between components`;
     }),
 
+    removeAssemblyMate: (mateId) => set(state => {
+      assemblyManager.removeMate(mateId);
+      state.mates = [...assemblyManager.mates];
+      state.assemblyComponents = [...assemblyManager.components];
+      state.statusMessage = 'Removed mate';
+    }),
+
     solveAssembly: () => set(state => {
-      const err = assemblyManager.solve();
+      const res = assemblyManager.solve();
+      const err = typeof res === 'object' && res.error !== undefined ? res.error : (typeof res === 'number' ? res : 0);
       state.assemblyComponents = [...assemblyManager.components];
       state.statusMessage = `Assembly solved (residual: ${err.toFixed(5)}mm)`;
     }),
@@ -601,9 +614,20 @@ export const useCADStore = create(
       state.statusMessage = 'Cleared assembly';
     }),
 
-    // ==================== PROJECT SAVE/LOAD ====================
+    // ==================== PROJECT SAVE/LOAD (LOSSLESS FORMAT) ====================
     saveProject: () => {
       const state = get();
+      const serializedComponents = (state.assemblyComponents || []).map(comp => ({
+        id: comp.id,
+        name: comp.name,
+        isFixed: comp.isFixed,
+        position: { x: comp.position.x, y: comp.position.y, z: comp.position.z },
+        quaternion: { x: comp.quaternion.x, y: comp.quaternion.y, z: comp.quaternion.z, w: comp.quaternion.w },
+        scale: { x: comp.scale.x, y: comp.scale.y, z: comp.scale.z },
+        geometryType: comp.geometryType || 'box',
+        dimensions: comp.dimensions || {},
+      }));
+
       const project = {
         version: '2.0.0',
         documentName: state.documentName,
@@ -615,6 +639,8 @@ export const useCADStore = create(
         rollbackIndex: state.rollbackIndex,
         activeMaterial: state.activeMaterial,
         settings: state.settings,
+        assemblyComponents: serializedComponents,
+        mates: state.mates || [],
         timestamp: Date.now(),
       };
       return JSON.stringify(project, null, 2);
@@ -632,6 +658,40 @@ export const useCADStore = create(
         state.rollbackIndex = project.rollbackIndex ?? (state.features.length - 1);
         state.activeMaterial = project.activeMaterial || 'Steel_1020';
         state.settings = { ...DEFAULT_SETTINGS, ...(project.settings || {}) };
+
+        // Restore assembly components
+        if (project.assemblyComponents && Array.isArray(project.assemblyComponents) && project.assemblyComponents.length > 0) {
+          assemblyManager.components = [];
+          project.assemblyComponents.forEach(c => {
+            let geom;
+            const dims = c.dimensions || {};
+            if (c.geometryType === 'cylinder') {
+              geom = new THREE.CylinderGeometry(dims.radius || 10, dims.radius || 10, dims.height || 30, 32);
+            } else if (c.geometryType === 'flange') {
+              geom = new THREE.CylinderGeometry(25, 25, 8, 32);
+            } else if (c.geometryType === 'pin') {
+              geom = new THREE.CylinderGeometry(6, 6, 40, 32);
+            } else {
+              geom = new THREE.BoxGeometry(dims.width || 30, dims.height || 20, dims.depth || 30);
+            }
+            const comp = assemblyManager.insertComponent(c.name, geom, c.isFixed);
+            comp.id = c.id;
+            comp.geometryType = c.geometryType || 'box';
+            comp.dimensions = dims;
+            if (c.position) comp.position.set(c.position.x, c.position.y, c.position.z);
+            if (c.quaternion) comp.quaternion.set(c.quaternion.x, c.quaternion.y, c.quaternion.z, c.quaternion.w);
+            if (c.scale) comp.scale.set(c.scale.x, c.scale.y, c.scale.z);
+            comp.updateMatrix();
+          });
+          state.assemblyComponents = [...assemblyManager.components];
+        }
+
+        // Restore assembly mates
+        if (project.mates && Array.isArray(project.mates)) {
+          assemblyManager.mates = [...project.mates];
+          state.mates = [...project.mates];
+        }
+
         state.undoStack = [];
         state.redoStack = [];
         state.needsRebuild = true;
