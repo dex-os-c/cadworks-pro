@@ -12,6 +12,7 @@ import { FEATURE_TYPES, SKETCH_ENTITY_TYPES } from './utils/constants';
 
 export default function App() {
   const needsRebuild = useCADStore(s => s.needsRebuild);
+  const rollbackIndex = useCADStore(s => s.rollbackIndex);
   const markRebuilt = useCADStore(s => s.markRebuilt);
   const features = useCADStore(s => s.features);
   const sketchEntities = useCADStore(s => s.sketchEntities);
@@ -69,7 +70,7 @@ export default function App() {
   useEffect(() => {
     if (needsRebuild) {
       try {
-        const result = featureEngine.rebuild(features, sketchEntities);
+        const result = featureEngine.rebuild(features, sketchEntities, rollbackIndex);
         if (result && result.bodies) {
           const bodyObjects = result.bodies.map((geom, idx) => ({
             id: `body_${idx}`,
@@ -78,14 +79,18 @@ export default function App() {
           }));
           setBodies(bodyObjects);
         }
-        markRebuilt();
-        setStatus('Model rebuild complete');
+        markRebuilt(result?.errors || []);
+        if (result?.errors && result.errors.length > 0) {
+          setStatus(`Rebuilt with ${result.errors.length} warning(s)`);
+        } else {
+          setStatus('Model rebuild complete');
+        }
       } catch (err) {
         console.error('Rebuild failed:', err);
         setStatus('Rebuild error: ' + err.message);
       }
     }
-  }, [needsRebuild, features, sketchEntities, setBodies, markRebuilt, setStatus]);
+  }, [needsRebuild, features, sketchEntities, rollbackIndex, setBodies, markRebuilt, setStatus]);
 
   return (
     <>

@@ -1,8 +1,8 @@
 // CADWorks Pro - Import Engine
 // Imports STL (Binary and ASCII), OBJ, DXF, and Project JSON
 import * as THREE from 'three';
-import { generateId } from '../utils/math';
-import { SKETCH_ENTITY_TYPES } from '../utils/constants';
+import { generateId } from '../utils/math.js';
+import { SKETCH_ENTITY_TYPES } from '../utils/constants.js';
 
 export class ImportEngine {
   /**

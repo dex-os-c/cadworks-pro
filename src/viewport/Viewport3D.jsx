@@ -314,6 +314,7 @@ function OrientationCubeHUD({ setViewOrientation }) {
  */
 export default function Viewport3D() {
   const bodies = useCADStore(s => s.bodies);
+  const assemblyComponents = useCADStore(s => s.assemblyComponents);
   const selectedEntities = useCADStore(s => s.selectedEntities);
   const setSelection = useCADStore(s => s.setSelection);
   const activeMaterial = useCADStore(s => s.activeMaterial);
@@ -444,6 +445,20 @@ export default function Viewport3D() {
             wireframeMode={wireframeMode}
             edgeDisplay={edgeDisplay}
             materialKey={activeMaterial}
+          />
+        ))}
+
+        {/* Assembly Components */}
+        {assemblyComponents && assemblyComponents.map((comp) => (
+          <CADBodyMesh
+            key={comp.id}
+            body={comp}
+            isSelected={selectedEntities.some(e => e.id === comp.id)}
+            onSelect={(b) => setSelection(b)}
+            shadedMode={shadedMode}
+            wireframeMode={wireframeMode}
+            edgeDisplay={edgeDisplay}
+            materialKey={comp.materialKey || activeMaterial}
           />
         ))}
 

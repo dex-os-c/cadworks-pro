@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { useCADStore } from '../../store/cadStore';
 import { TOOLS, FEATURE_TYPES } from '../../utils/constants';
+import { CAD_EXAMPLES } from '../../utils/examples';
 
 export default function CommandManager({ onExportClick, onMaterialClick, onMassPropsClick, onToggleTree }) {
   const activeTab = useCADStore(s => s.activeCommandTab);
@@ -31,8 +32,15 @@ export default function CommandManager({ onExportClick, onMaterialClick, onMassP
   const sectionActive = useCADStore(s => s.sectionViewActive);
   const documentName = useCADStore(s => s.documentName);
   const isModified = useCADStore(s => s.isModified);
+  const loadExampleModel = useCADStore(s => s.loadExampleModel);
+  const insertAssemblyPart = useCADStore(s => s.insertAssemblyPart);
+  const addAssemblyMate = useCADStore(s => s.addAssemblyMate);
+  const solveAssembly = useCADStore(s => s.solveAssembly);
+  const clearAssembly = useCADStore(s => s.clearAssembly);
+  const assemblyComponents = useCADStore(s => s.assemblyComponents);
 
   const [ribbonCollapsed, setRibbonCollapsed] = useState(false);
+  const [examplesOpen, setExamplesOpen] = useState(false);
 
   const tabList = [
     { id: 'Features', label: 'Features', icon: <Box size={14} /> },
@@ -110,6 +118,66 @@ export default function CommandManager({ onExportClick, onMaterialClick, onMassP
           <button className="qa-btn rebuild-btn" onClick={rebuild} title="Rebuild Feature Tree (F5)">
             <RefreshCw size={14} color="#38bdf8" /> <span className="qa-label">Rebuild</span>
           </button>
+
+          {/* Examples Dropdown */}
+          <div style={{ position: 'relative' }}>
+            <button
+              className="qa-btn"
+              onClick={() => setExamplesOpen(!examplesOpen)}
+              title="Load Mechanical CAD Examples"
+              style={{ background: 'rgba(251, 191, 36, 0.15)', borderColor: 'rgba(251, 191, 36, 0.4)' }}
+            >
+              <Sparkles size={14} color="#fbbf24" />
+              <span className="qa-label" style={{ color: '#fbbf24', fontWeight: 600 }}>Examples</span>
+              <ChevronDown size={11} color="#fbbf24" />
+            </button>
+
+            {examplesOpen && (
+              <div className="examples-dropdown-menu" style={{
+                position: 'absolute',
+                top: '100%',
+                left: 0,
+                marginTop: 4,
+                background: '#181b22',
+                border: '1px solid #38bdf840',
+                borderRadius: 6,
+                boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
+                width: 280,
+                zIndex: 1000,
+                padding: '6px 0',
+              }}>
+                <div style={{ padding: '6px 12px', fontSize: 10, fontWeight: 700, color: '#94a3b8', borderBottom: '1px solid #334155', letterSpacing: '0.5px' }}>
+                  PARAMETRIC MECHANICAL EXAMPLES
+                </div>
+                {CAD_EXAMPLES.map(ex => (
+                  <button
+                    key={ex.id}
+                    className="example-item-btn"
+                    onClick={() => {
+                      loadExampleModel(ex.create());
+                      setExamplesOpen(false);
+                    }}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'flex-start',
+                      width: '100%',
+                      padding: '8px 12px',
+                      background: 'none',
+                      border: 'none',
+                      textAlign: 'left',
+                      cursor: 'pointer',
+                    }}
+                    onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(56, 189, 248, 0.12)'}
+                    onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
+                  >
+                    <span style={{ fontSize: 12, fontWeight: 600, color: '#f1f5f9' }}>{ex.name}</span>
+                    <span style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>{ex.description}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Center Document Title with Modified indicator */}
@@ -428,8 +496,138 @@ export default function CommandManager({ onExportClick, onMaterialClick, onMassP
             </div>
           )}
 
-          {/* SURFACES, SHEET METAL, ASSEMBLY, DRAWING tabs */}
-          {(activeTab === 'Surfaces' || activeTab === 'Sheet Metal' || activeTab === 'Assembly' || activeTab === 'Drawing') && (
+          {/* ASSEMBLY TAB */}
+          {activeTab === 'Assembly' && (
+            <>
+              {/* INSERT COMPONENTS */}
+              <div className="tool-group">
+                <div className="tool-group-buttons">
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => insertAssemblyPart('Base_Plate', 'box', { width: 50, height: 12, depth: 50 })}
+                    title="Insert Base Mounting Plate"
+                  >
+                    <Box size={19} color="#38bdf8" />
+                    <span>Plate</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => insertAssemblyPart('Pin_Shaft', 'pin')}
+                    title="Insert Cylindrical Alignment Pin"
+                  >
+                    <CircleDot size={19} color="#fbbf24" />
+                    <span>Pin</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => insertAssemblyPart('Flange_Ring', 'flange')}
+                    title="Insert Circular Bolt Flange"
+                  >
+                    <Circle size={19} color="#2dd4bf" />
+                    <span>Flange</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => insertAssemblyPart('Cylinder_Rod', 'cylinder', { radius: 12, height: 35 })}
+                    title="Insert Cylinder Rod"
+                  >
+                    <Box size={19} color="#a78bfa" />
+                    <span>Cylinder</span>
+                  </button>
+                </div>
+                <div className="tool-group-label">COMPONENTS</div>
+              </div>
+
+              {/* ASSEMBLY MATES */}
+              <div className="tool-group">
+                <div className="tool-group-buttons">
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('coincident', assemblyComponents[0].id, 'top', assemblyComponents[1].id, 'bottom', 0);
+                    }}
+                    title="Coincident Mate (Align top and bottom faces)"
+                  >
+                    <Layers size={19} color="#38bdf8" />
+                    <span>Coincident</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('distance', assemblyComponents[0].id, 'top', assemblyComponents[1].id, 'bottom', 15);
+                    }}
+                    title="Distance Mate (15mm Offset)"
+                  >
+                    <ArrowRight size={19} color="#fb923c" />
+                    <span>Distance</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('concentric', assemblyComponents[0].id, 'z', assemblyComponents[1].id, 'z', 0);
+                    }}
+                    title="Concentric Mate (Align cylindrical axes)"
+                  >
+                    <CircleDot size={19} color="#2dd4bf" />
+                    <span>Concentric</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={() => {
+                      if (assemblyComponents.length < 2) {
+                        alert('Please insert at least two components to mate.');
+                        return;
+                      }
+                      addAssemblyMate('parallel', assemblyComponents[0].id, 'top', assemblyComponents[1].id, 'top', 0);
+                    }}
+                    title="Parallel Mate (Align face normals)"
+                  >
+                    <Spline size={19} color="#fde047" />
+                    <span>Parallel</span>
+                  </button>
+                </div>
+                <div className="tool-group-label">MATES</div>
+              </div>
+
+              {/* ACTIONS */}
+              <div className="tool-group">
+                <div className="tool-group-buttons">
+                  <button
+                    className="ribbon-btn"
+                    onClick={solveAssembly}
+                    title="Re-solve all assembly mates numerically"
+                  >
+                    <Play size={19} color="#4ade80" />
+                    <span>Solve</span>
+                  </button>
+                  <button
+                    className="ribbon-btn"
+                    onClick={clearAssembly}
+                    title="Remove all components and mates"
+                  >
+                    <Scissors size={19} color="#f87171" />
+                    <span>Clear</span>
+                  </button>
+                </div>
+                <div className="tool-group-label">ACTIONS</div>
+              </div>
+            </>
+          )}
+
+          {/* SURFACES, SHEET METAL, DRAWING tabs */}
+          {(activeTab === 'Surfaces' || activeTab === 'Sheet Metal' || activeTab === 'Drawing') && (
             <div className="tool-group">
               <div className="tool-group-buttons">
                 <button

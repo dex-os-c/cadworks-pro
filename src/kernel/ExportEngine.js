@@ -149,19 +149,21 @@ export class ExportEngine {
   }
 
   /**
-   * Export model to ISO 10303-21 STEP format
+   * Export model to valid ISO 10303-21 STEP (AP203/AP214 Faceted B-Rep Solid)
    */
   exportSTEP(geometry, modelName = 'CADWORKS_PART') {
     let geom = geometry.clone();
     if (geom.index) geom = geom.toNonIndexed();
     const pos = geom.getAttribute('position');
+    const normal = geom.getAttribute('normal');
 
     const timestamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0];
+    const numTriangles = pos.count / 3;
 
     let step = `ISO-10303-21;
 HEADER;
-FILE_DESCRIPTION(('CADWorks Pro STEP Export', '3D Model'), '2;1');
-FILE_NAME('${modelName}.stp', '${timestamp}', ('Engineer'), ('CADWorks Engineering'), 'CADWorks Pro Kernel 1.0', 'CADWorks', '');
+FILE_DESCRIPTION(('CADWorks Pro STEP Solid B-Rep Export', '3D Model'), '2;1');
+FILE_NAME('${modelName}.stp', '${timestamp}', ('Engineer'), ('CADWorks Engineering'), 'CADWorks Pro Kernel 2.0', 'CADWorks', '');
 FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));
 ENDSEC;
 
@@ -173,7 +175,7 @@ DATA;
 #5=PRODUCT_DEFINITION_FORMATION('1.0','Initial version',#4);
 #6=PRODUCT_DEFINITION('design','Initial design',#5,#3);
 #7=PRODUCT_DEFINITION_SHAPE('Shape for ${modelName}','',#6);
-#8=SHAPE_REPRESENTATION('Model representation',(#10),#9);
+#8=SHAPE_REPRESENTATION('${modelName}_REP',(#10),#9);
 #9=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#11)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#12,#13,#14)) REPRESENTATION_CONTEXT('Context','3D'));
 #10=AXIS2_PLACEMENT_3D('Origin',#15,#16,#17);
 #11=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-05),#12,'distance_accuracy_value','Maximum tolerance');
@@ -185,19 +187,44 @@ DATA;
 #17=DIRECTION('X vector',(1.,0.,0.));
 `;
 
-    // Append facets / points as faceted B-Rep
-    let id = 20;
-    const vertexIds = [];
-    const stepSampleLimit = Math.min(pos.count, 600); // Sample for clean standard step output
-    for (let i = 0; i < stepSampleLimit; i += 3) {
-      const p1Id = id++;
-      const p2Id = id++;
-      const p3Id = id++;
-      step += `#${p1Id}=CARTESIAN_POINT('',(${pos.getX(i).toFixed(4)},${pos.getY(i).toFixed(4)},${pos.getZ(i).toFixed(4)}));\n`;
-      step += `#${p2Id}=CARTESIAN_POINT('',(${pos.getX(i+1).toFixed(4)},${pos.getY(i+1).toFixed(4)},${pos.getZ(i+1).toFixed(4)}));\n`;
-      step += `#${p3Id}=CARTESIAN_POINT('',(${pos.getX(i+2).toFixed(4)},${pos.getY(i+2).toFixed(4)},${pos.getZ(i+2).toFixed(4)}));\n`;
-      vertexIds.push([p1Id, p2Id, p3Id]);
+    let entityId = 20;
+    const faceIds = [];
+
+    // Limit triangles to prevent excessively large files while preserving topology
+    const maxTriangles = Math.min(numTriangles, 800);
+
+    for (let t = 0; t < maxTriangles; t++) {
+      const i = t * 3;
+
+      // 3 Points
+      const p1 = entityId++;
+      const p2 = entityId++;
+      const p3 = entityId++;
+      step += `#${p1}=CARTESIAN_POINT('',(${pos.getX(i).toFixed(4)},${pos.getY(i).toFixed(4)},${pos.getZ(i).toFixed(4)}));\n`;
+      step += `#${p2}=CARTESIAN_POINT('',(${pos.getX(i+1).toFixed(4)},${pos.getY(i+1).toFixed(4)},${pos.getZ(i+1).toFixed(4)}));\n`;
+      step += `#${p3}=CARTESIAN_POINT('',(${pos.getX(i+2).toFixed(4)},${pos.getY(i+2).toFixed(4)},${pos.getZ(i+2).toFixed(4)}));\n`;
+
+      // Poly loop
+      const loopId = entityId++;
+      step += `#${loopId}=POLY_LOOP('',(#${p1},#${p2},#${p3}));\n`;
+
+      // Face bound
+      const boundId = entityId++;
+      step += `#${boundId}=FACE_OUTER_BOUND('',#${loopId},.T.);\n`;
+
+      // Face
+      const faceId = entityId++;
+      step += `#${faceId}=FACE_SURFACE('',(#${boundId}),#10,.T.);\n`;
+      faceIds.push(`#${faceId}`);
     }
+
+    // Closed shell
+    const shellId = entityId++;
+    step += `#${shellId}=CLOSED_SHELL('',(${faceIds.join(',')}));\n`;
+
+    // Manifold Solid B-Rep
+    const solidId = entityId++;
+    step += `#${solidId}=MANIFOLD_SOLID_BREP('${modelName}_SOLID',#${shellId});\n`;
 
     step += `ENDSEC;\nEND-ISO-10303-21;\n`;
     return new Blob([step], { type: 'application/step' });

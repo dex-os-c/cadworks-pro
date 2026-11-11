@@ -3,7 +3,7 @@
 // fillets, chamfers, shells, holes, patterns, mirrors, and CSG booleans.
 
 import * as THREE from 'three';
-import { EPSILON, vec3, generateId } from '../utils/math';
+import { EPSILON, vec3, generateId } from '../utils/math.js';
 
 // ============================================================================
 // BSP-Tree CSG Implementation
@@ -377,7 +377,7 @@ class GeometryEngine {
   extrudeProfile(shape, depth, direction = null, options = {}) {
     const {
       symmetric = false,
-      endCondition = 'blind', // 'blind', 'through', 'upTo'
+      endCondition = 'blind', // 'blind', 'through', 'upTo', 'midplane'
       draft = false,
       draftAngle = 0,
       steps = 1,
@@ -385,16 +385,19 @@ class GeometryEngine {
       bevelThickness = 0,
       bevelSize = 0,
       bevelSegments = 1,
+      flip = false,
+      plane = 'Front',
     } = options;
 
+    const isMidplane = symmetric || endCondition === 'midplane';
     let actualDepth = depth;
     if (endCondition === 'through') {
-      actualDepth = 1000; // Large value to simulate through-all
+      actualDepth = 500;
     }
 
     const extrudeSettings = {
       steps: steps,
-      depth: symmetric ? actualDepth / 2 : actualDepth,
+      depth: actualDepth,
       bevelEnabled: bevelEnabled || draft,
       bevelThickness: draft ? Math.tan(draftAngle * Math.PI / 180) * actualDepth : bevelThickness,
       bevelSize: draft ? Math.tan(draftAngle * Math.PI / 180) * actualDepth : bevelSize,
@@ -403,13 +406,30 @@ class GeometryEngine {
 
     const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
 
-    // If symmetric, shift the geometry so it's centered
-    if (symmetric) {
-      geometry.translate(0, 0, -actualDepth / 4);
+    // Symmetric / Mid-plane: center around sketch plane
+    if (isMidplane) {
+      geometry.translate(0, 0, -actualDepth / 2);
     }
 
-    // Apply direction rotation if specified and not default Z
-    if (direction) {
+    // Direction flip
+    if (flip) {
+      geometry.translate(0, 0, isMidplane ? 0 : -actualDepth);
+      const pos = geometry.getAttribute('position');
+      for (let i = 0; i < pos.count; i++) {
+        pos.setZ(i, -pos.getZ(i));
+      }
+      geometry.computeVertexNormals();
+    }
+
+    // Transform by sketch plane orientation if specified
+    const planeName = typeof direction === 'string' ? direction : plane;
+    if (planeName) {
+      if (planeName === 'Top' || planeName === 'XZ') {
+        geometry.applyMatrix4(new THREE.Matrix4().makeRotationX(-Math.PI / 2));
+      } else if (planeName === 'Right' || planeName === 'YZ') {
+        geometry.applyMatrix4(new THREE.Matrix4().makeRotationY(Math.PI / 2));
+      }
+    } else if (direction instanceof THREE.Vector3) {
       const defaultDir = new THREE.Vector3(0, 0, 1);
       const dir = direction.clone().normalize();
       if (dir.distanceTo(defaultDir) > EPSILON) {
@@ -1101,6 +1121,9 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   booleanUnion(geomA, geomB) {
+    if (!geomA) return geomB ? geomB.clone() : null;
+    if (!geomB) return geomA ? geomA.clone() : null;
+
     const a = new CSGNode(geometryToPolygons(geomA.clone()));
     const b = new CSGNode(geometryToPolygons(geomB.clone()));
 
@@ -1124,6 +1147,9 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   booleanSubtract(geomA, geomB) {
+    if (!geomA) return null;
+    if (!geomB) return geomA.clone();
+
     const a = new CSGNode(geometryToPolygons(geomA.clone()));
     const b = new CSGNode(geometryToPolygons(geomB.clone()));
 
@@ -1303,8 +1329,67 @@ class GeometryEngine {
    * @param {Object[]} entities - Array of sketch entity objects
    * @returns {THREE.Shape}
    */
-  shapeFromSketchEntities(entities) {
+  /**
+   * Expand open line segments into a closed thin-wall profile shape
+   */
+  createThinProfileShape(entities, wallThickness = 2.0) {
+    const nonConstruction = entities.filter(e => !e.construction);
+    if (nonConstruction.length === 0) return new THREE.Shape();
+
+    const half = Math.max(0.1, wallThickness / 2);
+    const shape = new THREE.Shape();
+
+    const pts = [];
+    nonConstruction.forEach(ent => {
+      if (ent.p1 && ent.p2) {
+        if (pts.length === 0) pts.push(ent.p1);
+        pts.push(ent.p2);
+      }
+    });
+
+    if (pts.length < 2) return new THREE.Shape();
+
+    const leftPts = [];
+    const rightPts = [];
+
+    for (let i = 0; i < pts.length; i++) {
+      let dx, dy;
+      if (i === 0) {
+        dx = pts[1].x - pts[0].x;
+        dy = pts[1].y - pts[0].y;
+      } else if (i === pts.length - 1) {
+        dx = pts[i].x - pts[i - 1].x;
+        dy = pts[i].y - pts[i - 1].y;
+      } else {
+        dx = pts[i + 1].x - pts[i - 1].x;
+        dy = pts[i + 1].y - pts[i - 1].y;
+      }
+      const len = Math.hypot(dx, dy) || 1e-6;
+      const nx = -dy / len;
+      const ny = dx / len;
+
+      leftPts.push({ x: pts[i].x + nx * half, y: pts[i].y + ny * half });
+      rightPts.push({ x: pts[i].x - nx * half, y: pts[i].y - ny * half });
+    }
+
+    shape.moveTo(leftPts[0].x, leftPts[0].y);
+    for (let i = 1; i < leftPts.length; i++) {
+      shape.lineTo(leftPts[i].x, leftPts[i].y);
+    }
+    for (let i = rightPts.length - 1; i >= 0; i--) {
+      shape.lineTo(rightPts[i].x, rightPts[i].y);
+    }
+    shape.closePath();
+    return shape;
+  }
+
+  shapeFromSketchEntities(entities, options = {}) {
     if (!entities || entities.length === 0) return new THREE.Shape();
+
+    // Check if Thin Feature is requested
+    if (options.thin) {
+      return this.createThinProfileShape(entities, options.wallThickness || 2.0);
+    }
 
     // Separate circles from other entities
     const circles = entities.filter(e => e.type === 'circle');
@@ -1662,8 +1747,8 @@ class GeometryEngine {
       switch (entity.type) {
         case 'line':
           return [
-            { x: entity.start?.x ?? entity.x1 ?? 0, y: entity.start?.y ?? entity.y1 ?? 0 },
-            { x: entity.end?.x ?? entity.x2 ?? 0, y: entity.end?.y ?? entity.y2 ?? 0 },
+            { x: entity.p1?.x ?? entity.start?.x ?? entity.x1 ?? 0, y: entity.p1?.y ?? entity.start?.y ?? entity.y1 ?? 0 },
+            { x: entity.p2?.x ?? entity.end?.x ?? entity.x2 ?? 0, y: entity.p2?.y ?? entity.end?.y ?? entity.y2 ?? 0 },
           ];
         case 'arc':
           return [
@@ -1755,8 +1840,8 @@ class GeometryEngine {
       switch (entity.type) {
         case 'line':
           shape.lineTo(
-            entity.end?.x ?? entity.x2 ?? 0,
-            entity.end?.y ?? entity.y2 ?? 0
+            entity.p2?.x ?? entity.end?.x ?? entity.x2 ?? 0,
+            entity.p2?.y ?? entity.end?.y ?? entity.y2 ?? 0
           );
           break;
         case 'arc': {
@@ -1849,8 +1934,8 @@ class GeometryEngine {
     switch (entity.type) {
       case 'line':
         return [
-          { x: entity.start?.x ?? entity.x1 ?? 0, y: entity.start?.y ?? entity.y1 ?? 0 },
-          { x: entity.end?.x ?? entity.x2 ?? 0, y: entity.end?.y ?? entity.y2 ?? 0 },
+          { x: entity.p1?.x ?? entity.start?.x ?? entity.x1 ?? 0, y: entity.p1?.y ?? entity.start?.y ?? entity.y1 ?? 0 },
+          { x: entity.p2?.x ?? entity.end?.x ?? entity.x2 ?? 0, y: entity.p2?.y ?? entity.end?.y ?? entity.y2 ?? 0 },
         ];
       case 'arc': {
         const cx = entity.center?.x ?? entity.cx ?? 0;

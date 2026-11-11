@@ -1,11 +1,12 @@
-// CADWorks Pro - Central State Management Store
+// CADWorks Pro - Central State Management Store (Robust Parametric Architecture)
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import { generateId } from '../utils/math';
-import { TOOLS, APP_MODES, DEFAULT_SETTINGS, FEATURE_TYPES, MATERIALS } from '../utils/constants';
+import * as THREE from 'three';
+import { generateId } from '../utils/math.js';
+import { TOOLS, APP_MODES, DEFAULT_SETTINGS, FEATURE_TYPES, MATERIALS, MATE_TYPES } from '../utils/constants.js';
+import { assemblyManager } from '../assembly/AssemblyManager.js';
 
-// Maximum undo history size
-const MAX_UNDO_HISTORY = 50;
+const MAX_UNDO_HISTORY = 40;
 
 const initialState = {
   // Application mode
@@ -25,24 +26,25 @@ const initialState = {
   hoveredEntity: null,
   selectionMode: 'body', // 'body', 'face', 'edge', 'vertex'
   
-  // Feature tree
+  // Feature tree with Rollback Bar & Dependency Graph
   features: [],
   activeFeatureIndex: -1,
+  rollbackIndex: -1, // -1 means at the very end of the tree (no rollback)
   expandedNodes: new Set(['origin', 'planes']),
   
   // Sketching state
   isSketchActive: false,
   activeSketchId: null,
   activeSketchPlane: 'Front',
-  sketchEntities: {},  // { sketchId: [entities] }
+  sketchEntities: {},    // { sketchId: [entities] }
   sketchConstraints: {}, // { sketchId: [constraints] }
-  sketchDimensions: {}, // { sketchId: [dimensions] }
+  sketchDimensions: {},  // { sketchId: [dimensions] }
   currentSketchPoints: [],
   snapEnabled: true,
   constructionMode: false,
   
   // 3D Model state
-  bodies: [], // Array of { id, mesh, wireframe, material, visible }
+  bodies: [], // Array of { id, geometry, wireframe, visible }
   
   // Material
   activeMaterial: 'Steel_1020',
@@ -75,20 +77,14 @@ const initialState = {
   // Settings
   settings: { ...DEFAULT_SETTINGS },
   
-  // Undo/Redo
+  // Full Snapshot Undo/Redo Stack (Never lies, never drifts)
   undoStack: [],
   redoStack: [],
-  
-  // Camera reference (set by viewport)
-  cameraRef: null,
-  controlsRef: null,
-  sceneRef: null,
-  rendererRef: null,
   
   // Measurements
   measurements: [],
   
-  // Assembly (when in assembly mode)
+  // Assembly
   assemblyComponents: [],
   mates: [],
   
@@ -98,8 +94,9 @@ const initialState = {
   // Command manager tab
   activeCommandTab: 'Features',
   
-  // Rebuild needed
+  // Rebuild flag
   needsRebuild: false,
+  rebuildErrors: [],
   
   // Mass properties cache
   massProperties: null,
@@ -108,6 +105,24 @@ const initialState = {
 export const useCADStore = create(
   immer((set, get) => ({
     ...initialState,
+
+    // Helper to capture state snapshot for undo
+    _captureUndoSnapshot: (state, actionName = 'Action') => {
+      state.undoStack.push({
+        actionName,
+        snapshot: {
+          features: JSON.parse(JSON.stringify(state.features)),
+          sketchEntities: JSON.parse(JSON.stringify(state.sketchEntities)),
+          sketchConstraints: JSON.parse(JSON.stringify(state.sketchConstraints)),
+          sketchDimensions: JSON.parse(JSON.stringify(state.sketchDimensions)),
+          rollbackIndex: state.rollbackIndex,
+          activeMaterial: state.activeMaterial,
+        },
+      });
+      if (state.undoStack.length > MAX_UNDO_HISTORY) state.undoStack.shift();
+      state.redoStack = [];
+      state.isModified = true;
+    },
 
     // ==================== TOOL MANAGEMENT ====================
     setActiveTool: (tool) => set(state => {
@@ -153,87 +168,148 @@ export const useCADStore = create(
       state.statusMessage = `Selection mode: ${mode}`;
     }),
 
-    // ==================== FEATURE MANAGEMENT ====================
+    // ==================== FEATURE MANAGEMENT WITH DEPENDENCY GRAPH ====================
     addFeature: (feature) => set(state => {
+      get()._captureUndoSnapshot(state, `Add ${feature.name || feature.type}`);
+
+      // Derive dependency parent IDs
+      const parentIds = [];
+      if (feature.sketchId) {
+        const parentSketch = state.features.find(f => f.sketchId === feature.sketchId || f.id === feature.sketchId);
+        if (parentSketch) parentIds.push(parentSketch.id);
+      }
+      if (feature.toolFeatureId) {
+        parentIds.push(feature.toolFeatureId);
+      }
+
       const newFeature = {
-        id: generateId('feature'),
+        id: generateId('feat'),
         timestamp: Date.now(),
         visible: true,
         suppressed: false,
+        parentIds: parentIds,
+        childIds: [],
         ...feature,
       };
-      // Save undo state
-      state.undoStack.push({
-        type: 'addFeature',
-        featureIndex: state.features.length,
-        feature: JSON.parse(JSON.stringify(newFeature)),
+
+      // Register this feature as child of parents
+      parentIds.forEach(pid => {
+        const p = state.features.find(f => f.id === pid);
+        if (p && !p.childIds.includes(newFeature.id)) {
+          p.childIds.push(newFeature.id);
+        }
       });
-      if (state.undoStack.length > MAX_UNDO_HISTORY) state.undoStack.shift();
-      state.redoStack = [];
-      
-      state.features.push(newFeature);
-      state.activeFeatureIndex = state.features.length - 1;
-      state.isModified = true;
+
+      // Insert at rollback index if rolled back, otherwise append
+      const isRolledBack = state.rollbackIndex >= 0 && state.rollbackIndex < state.features.length - 1;
+      if (isRolledBack) {
+        const insertAt = state.rollbackIndex + 1;
+        state.features.splice(insertAt, 0, newFeature);
+        state.rollbackIndex = insertAt;
+        state.activeFeatureIndex = insertAt;
+      } else {
+        state.features.push(newFeature);
+        state.activeFeatureIndex = state.features.length - 1;
+        state.rollbackIndex = state.features.length - 1;
+      }
+
       state.needsRebuild = true;
-      state.statusMessage = `Added: ${feature.name || feature.type}`;
+      state.statusMessage = `Added ${newFeature.name}`;
       return newFeature;
     }),
 
     updateFeature: (featureId, updates) => set(state => {
       const index = state.features.findIndex(f => f.id === featureId);
       if (index !== -1) {
-        // Save undo state
-        state.undoStack.push({
-          type: 'updateFeature',
-          featureId,
-          oldValues: JSON.parse(JSON.stringify(state.features[index])),
-        });
-        if (state.undoStack.length > MAX_UNDO_HISTORY) state.undoStack.shift();
-        state.redoStack = [];
-        
+        get()._captureUndoSnapshot(state, `Update ${state.features[index].name}`);
         Object.assign(state.features[index], updates);
-        state.isModified = true;
         state.needsRebuild = true;
+        state.statusMessage = `Updated ${state.features[index].name}`;
       }
     }),
 
     removeFeature: (featureId) => set(state => {
       const index = state.features.findIndex(f => f.id === featureId);
       if (index !== -1) {
-        state.undoStack.push({
-          type: 'removeFeature',
-          featureIndex: index,
-          feature: JSON.parse(JSON.stringify(state.features[index])),
-        });
-        if (state.undoStack.length > MAX_UNDO_HISTORY) state.undoStack.shift();
-        state.redoStack = [];
+        get()._captureUndoSnapshot(state, `Delete ${state.features[index].name}`);
         
+        // Remove from parents' childIds
+        const feat = state.features[index];
+        if (feat.parentIds) {
+          feat.parentIds.forEach(pid => {
+            const p = state.features.find(f => f.id === pid);
+            if (p) p.childIds = p.childIds.filter(cid => cid !== featureId);
+          });
+        }
+
+        // Also clean associated sketch entities if deleting a sketch
+        if (feat.type === FEATURE_TYPES.SKETCH && feat.sketchId) {
+          delete state.sketchEntities[feat.sketchId];
+          delete state.sketchConstraints[feat.sketchId];
+          delete state.sketchDimensions[feat.sketchId];
+        }
+
         state.features.splice(index, 1);
-        state.isModified = true;
+        if (state.rollbackIndex >= state.features.length) {
+          state.rollbackIndex = state.features.length - 1;
+        }
         state.needsRebuild = true;
+        state.statusMessage = 'Feature deleted';
       }
     }),
 
     toggleFeatureVisibility: (featureId) => set(state => {
       const feat = state.features.find(f => f.id === featureId);
-      if (feat) feat.visible = !feat.visible;
+      if (feat) {
+        feat.visible = !feat.visible;
+      }
     }),
 
+    // Cascading Suppress & Unsuppress
     toggleFeatureSuppressed: (featureId) => set(state => {
       const feat = state.features.find(f => f.id === featureId);
-      if (feat) {
-        feat.suppressed = !feat.suppressed;
-        state.needsRebuild = true;
+      if (!feat) return;
+
+      get()._captureUndoSnapshot(state, `Toggle Suppress ${feat.name}`);
+      const willSuppress = !feat.suppressed;
+      feat.suppressed = willSuppress;
+
+      if (willSuppress) {
+        // Cascade suppress to all downstream dependent children
+        const queue = [...(feat.childIds || [])];
+        while (queue.length > 0) {
+          const cid = queue.shift();
+          const child = state.features.find(f => f.id === cid);
+          if (child) {
+            child.suppressed = true;
+            if (child.childIds) queue.push(...child.childIds);
+          }
+        }
+      } else {
+        // Unsuppress: ensure parents are unsuppressed
+        const queue = [...(feat.parentIds || [])];
+        while (queue.length > 0) {
+          const pid = queue.shift();
+          const parent = state.features.find(f => f.id === pid);
+          if (parent) {
+            parent.suppressed = false;
+            if (parent.parentIds) queue.push(...parent.parentIds);
+          }
+        }
       }
+
+      state.needsRebuild = true;
+      state.statusMessage = willSuppress ? `Suppressed ${feat.name}` : `Unsuppressed ${feat.name}`;
     }),
 
-    reorderFeature: (featureId, newIndex) => set(state => {
-      const oldIndex = state.features.findIndex(f => f.id === featureId);
-      if (oldIndex !== -1 && newIndex !== oldIndex) {
-        const [feature] = state.features.splice(oldIndex, 1);
-        state.features.splice(newIndex, 0, feature);
-        state.needsRebuild = true;
-      }
+    // Rollback Bar Management
+    setRollbackIndex: (index) => set(state => {
+      const clamped = Math.max(-1, Math.min(state.features.length - 1, index));
+      state.rollbackIndex = clamped;
+      state.needsRebuild = true;
+      state.statusMessage = clamped === -1 || clamped === state.features.length - 1
+        ? 'Rollback bar at end of tree'
+        : `Rolled back to feature ${clamped + 1}`;
     }),
 
     setActiveFeature: (index) => set(state => {
@@ -250,9 +326,9 @@ export const useCADStore = create(
       state.sketchConstraints[sketchId] = [];
       state.sketchDimensions[sketchId] = [];
       state.currentSketchPoints = [];
-      state.activeTool = TOOLS.SELECT;
+      state.activeTool = TOOLS.SKETCH_LINE;
       state.activeCommandTab = 'Sketch';
-      state.statusMessage = `Editing Sketch on ${plane} plane`;
+      state.statusMessage = `Sketching on ${plane} plane (Select tools or draw)`;
     }),
 
     endSketch: (confirm = true) => set(state => {
@@ -260,26 +336,31 @@ export const useCADStore = create(
       const sketchId = state.activeSketchId;
       
       if (confirm && state.sketchEntities[sketchId]?.length > 0) {
-        // Add sketch as a feature
-        const sketchFeature = {
-          type: FEATURE_TYPES.SKETCH,
-          name: `Sketch${state.features.filter(f => f.type === FEATURE_TYPES.SKETCH).length + 1}`,
-          sketchId: sketchId,
-          plane: state.activeSketchPlane,
-          entities: JSON.parse(JSON.stringify(state.sketchEntities[sketchId])),
-          constraints: JSON.parse(JSON.stringify(state.sketchConstraints[sketchId] || [])),
-          dimensions: JSON.parse(JSON.stringify(state.sketchDimensions[sketchId] || [])),
-        };
-        
-        state.features.push({
-          id: generateId('feature'),
-          timestamp: Date.now(),
-          visible: true,
-          suppressed: false,
-          ...sketchFeature,
-        });
+        get()._captureUndoSnapshot(state, 'Create Sketch');
+
+        const existingSketchFeature = state.features.find(f => f.sketchId === sketchId);
+        if (!existingSketchFeature) {
+          const sketchFeature = {
+            id: generateId('feat_sketch'),
+            type: FEATURE_TYPES.SKETCH,
+            name: `Sketch${state.features.filter(f => f.type === FEATURE_TYPES.SKETCH).length + 1}`,
+            sketchId: sketchId,
+            plane: state.activeSketchPlane,
+            visible: true,
+            suppressed: false,
+            parentIds: [],
+            childIds: [],
+          };
+          
+          if (state.rollbackIndex >= 0 && state.rollbackIndex < state.features.length - 1) {
+            state.features.splice(state.rollbackIndex + 1, 0, sketchFeature);
+            state.rollbackIndex++;
+          } else {
+            state.features.push(sketchFeature);
+            state.rollbackIndex = state.features.length - 1;
+          }
+        }
       } else if (!confirm) {
-        // Discard
         delete state.sketchEntities[sketchId];
         delete state.sketchConstraints[sketchId];
         delete state.sketchDimensions[sketchId];
@@ -291,8 +372,8 @@ export const useCADStore = create(
       state.constructionMode = false;
       state.activeTool = TOOLS.SELECT;
       state.activeCommandTab = 'Features';
-      state.statusMessage = 'Ready';
-      state.isModified = true;
+      state.statusMessage = 'Sketch closed. Ready to Extrude/Revolve.';
+      state.needsRebuild = true;
     }),
 
     addSketchEntity: (entity) => set(state => {
@@ -300,7 +381,7 @@ export const useCADStore = create(
       if (!sketchId) return;
       if (!state.sketchEntities[sketchId]) state.sketchEntities[sketchId] = [];
       const newEntity = {
-        id: generateId('entity'),
+        id: generateId('ent'),
         construction: state.constructionMode,
         ...entity,
       };
@@ -314,19 +395,12 @@ export const useCADStore = create(
       state.sketchEntities[sketchId] = state.sketchEntities[sketchId].filter(e => e.id !== entityId);
     }),
 
-    updateSketchEntity: (entityId, updates) => set(state => {
-      const sketchId = state.activeSketchId;
-      if (!sketchId || !state.sketchEntities[sketchId]) return;
-      const entity = state.sketchEntities[sketchId].find(e => e.id === entityId);
-      if (entity) Object.assign(entity, updates);
-    }),
-
     addSketchConstraint: (constraint) => set(state => {
       const sketchId = state.activeSketchId;
       if (!sketchId) return;
       if (!state.sketchConstraints[sketchId]) state.sketchConstraints[sketchId] = [];
       state.sketchConstraints[sketchId].push({
-        id: generateId('constraint'),
+        id: generateId('const'),
         ...constraint,
       });
     }),
@@ -341,14 +415,6 @@ export const useCADStore = create(
       });
     }),
 
-    setCurrentSketchPoints: (points) => set(state => {
-      state.currentSketchPoints = points;
-    }),
-
-    addCurrentSketchPoint: (point) => set(state => {
-      state.currentSketchPoints.push(point);
-    }),
-
     toggleConstructionMode: () => set(state => {
       state.constructionMode = !state.constructionMode;
     }),
@@ -358,10 +424,7 @@ export const useCADStore = create(
       if (feature && feature.type === FEATURE_TYPES.SKETCH) {
         state.isSketchActive = true;
         state.activeSketchId = feature.sketchId;
-        state.activeSketchPlane = feature.plane;
-        state.sketchEntities[feature.sketchId] = JSON.parse(JSON.stringify(feature.entities || []));
-        state.sketchConstraints[feature.sketchId] = JSON.parse(JSON.stringify(feature.constraints || []));
-        state.sketchDimensions[feature.sketchId] = JSON.parse(JSON.stringify(feature.dimensions || []));
+        state.activeSketchPlane = feature.plane || 'Front';
         state.currentSketchPoints = [];
         state.activeCommandTab = 'Sketch';
         state.statusMessage = `Editing ${feature.name}`;
@@ -373,28 +436,11 @@ export const useCADStore = create(
       state.bodies = bodies;
     }),
 
-    addBody: (body) => set(state => {
-      state.bodies.push({
-        id: generateId('body'),
-        visible: true,
-        ...body,
-      });
-    }),
-
-    removeBody: (bodyId) => set(state => {
-      state.bodies = state.bodies.filter(b => b.id !== bodyId);
-    }),
-
-    updateBody: (bodyId, updates) => set(state => {
-      const body = state.bodies.find(b => b.id === bodyId);
-      if (body) Object.assign(body, updates);
-    }),
-
     // ==================== MATERIAL ====================
     setMaterial: (materialKey) => set(state => {
       state.activeMaterial = materialKey;
       state.isModified = true;
-      state.massProperties = null; // Invalidate cache
+      state.massProperties = null;
     }),
 
     // ==================== VIEW STATE ====================
@@ -410,10 +456,7 @@ export const useCADStore = create(
     toggleEdges: () => set(state => { state.edgeDisplay = !state.edgeDisplay; }),
     toggleWireframe: () => set(state => { state.wireframeMode = !state.wireframeMode; }),
     togglePerspective: () => set(state => { state.perspectiveView = !state.perspectiveView; }),
-    
-    toggleSectionView: () => set(state => {
-      state.sectionViewActive = !state.sectionViewActive;
-    }),
+    toggleSectionView: () => set(state => { state.sectionViewActive = !state.sectionViewActive; }),
 
     // ==================== PROPERTY PANEL ====================
     openPropertyPanel: (content) => set(state => {
@@ -424,17 +467,6 @@ export const useCADStore = create(
     closePropertyPanel: () => set(state => {
       state.propertyPanelOpen = false;
       state.propertyPanelContent = null;
-    }),
-
-    // ==================== DIALOGS ====================
-    openDialog: (dialogType, props = {}) => set(state => {
-      state.activeDialog = dialogType;
-      state.dialogProps = props;
-    }),
-
-    closeDialog: () => set(state => {
-      state.activeDialog = null;
-      state.dialogProps = {};
     }),
 
     // ==================== COMMAND TAB ====================
@@ -448,163 +480,139 @@ export const useCADStore = create(
       state.statusProgress = progress;
     }),
 
-    // ==================== UNDO / REDO ====================
+    // ==================== SOLID SNAPSHOT-BASED UNDO / REDO ====================
     undo: () => set(state => {
       if (state.undoStack.length === 0) return;
-      const action = state.undoStack.pop();
-      
-      switch (action.type) {
-        case 'addFeature':
-          state.redoStack.push({
-            type: 'addFeature',
-            feature: JSON.parse(JSON.stringify(state.features[action.featureIndex])),
-            featureIndex: action.featureIndex,
-          });
-          state.features.splice(action.featureIndex, 1);
-          break;
-        case 'removeFeature':
-          state.redoStack.push({
-            type: 'removeFeature',
-            feature: JSON.parse(JSON.stringify(action.feature)),
-            featureIndex: action.featureIndex,
-          });
-          state.features.splice(action.featureIndex, 0, action.feature);
-          break;
-        case 'updateFeature': {
-          const feat = state.features.find(f => f.id === action.featureId);
-          if (feat) {
-            state.redoStack.push({
-              type: 'updateFeature',
-              featureId: action.featureId,
-              oldValues: JSON.parse(JSON.stringify(feat)),
-            });
-            Object.assign(feat, action.oldValues);
-          }
-          break;
-        }
-      }
+
+      const currentSnapshot = {
+        features: JSON.parse(JSON.stringify(state.features)),
+        sketchEntities: JSON.parse(JSON.stringify(state.sketchEntities)),
+        sketchConstraints: JSON.parse(JSON.stringify(state.sketchConstraints)),
+        sketchDimensions: JSON.parse(JSON.stringify(state.sketchDimensions)),
+        rollbackIndex: state.rollbackIndex,
+        activeMaterial: state.activeMaterial,
+      };
+      state.redoStack.push({ snapshot: currentSnapshot });
+
+      const prev = state.undoStack.pop();
+      const s = prev.snapshot;
+      state.features = s.features;
+      state.sketchEntities = s.sketchEntities;
+      state.sketchConstraints = s.sketchConstraints;
+      state.sketchDimensions = s.sketchDimensions;
+      state.rollbackIndex = s.rollbackIndex;
+      state.activeMaterial = s.activeMaterial;
+
       state.needsRebuild = true;
-      state.isModified = true;
-      state.statusMessage = 'Undo';
+      state.statusMessage = `Undo: ${prev.actionName || 'Action'}`;
     }),
 
     redo: () => set(state => {
       if (state.redoStack.length === 0) return;
-      const action = state.redoStack.pop();
-      
-      switch (action.type) {
-        case 'addFeature':
-          state.undoStack.push({
-            type: 'addFeature',
-            featureIndex: action.featureIndex,
-            feature: JSON.parse(JSON.stringify(action.feature)),
-          });
-          state.features.splice(action.featureIndex, 0, action.feature);
-          break;
-        case 'removeFeature':
-          state.undoStack.push({
-            type: 'removeFeature',
-            feature: JSON.parse(JSON.stringify(action.feature)),
-            featureIndex: action.featureIndex,
-          });
-          const idx = state.features.findIndex(f => f.id === action.feature.id);
-          if (idx !== -1) state.features.splice(idx, 1);
-          break;
-        case 'updateFeature': {
-          const feat = state.features.find(f => f.id === action.featureId);
-          if (feat) {
-            state.undoStack.push({
-              type: 'updateFeature',
-              featureId: action.featureId,
-              oldValues: JSON.parse(JSON.stringify(feat)),
-            });
-            Object.assign(feat, action.oldValues);
-          }
-          break;
-        }
-      }
+
+      const currentSnapshot = {
+        features: JSON.parse(JSON.stringify(state.features)),
+        sketchEntities: JSON.parse(JSON.stringify(state.sketchEntities)),
+        sketchConstraints: JSON.parse(JSON.stringify(state.sketchConstraints)),
+        sketchDimensions: JSON.parse(JSON.stringify(state.sketchDimensions)),
+        rollbackIndex: state.rollbackIndex,
+        activeMaterial: state.activeMaterial,
+      };
+      state.undoStack.push({ snapshot: currentSnapshot });
+
+      const next = state.redoStack.pop();
+      const s = next.snapshot;
+      state.features = s.features;
+      state.sketchEntities = s.sketchEntities;
+      state.sketchConstraints = s.sketchConstraints;
+      state.sketchDimensions = s.sketchDimensions;
+      state.rollbackIndex = s.rollbackIndex;
+      state.activeMaterial = s.activeMaterial;
+
       state.needsRebuild = true;
-      state.isModified = true;
       state.statusMessage = 'Redo';
     }),
 
     // ==================== REBUILD ====================
-    markRebuilt: () => set(state => {
+    markRebuilt: (errors = []) => set(state => {
       state.needsRebuild = false;
+      state.rebuildErrors = errors;
     }),
 
     rebuild: () => set(state => {
       state.needsRebuild = true;
-      state.statusMessage = 'Rebuilding...';
-    }),
-
-    // ==================== NOTIFICATIONS ====================
-    addNotification: (message, type = 'info') => set(state => {
-      state.notifications.push({
-        id: generateId('notif'),
-        message,
-        type,
-        timestamp: Date.now(),
-      });
-      // Keep only last 10
-      if (state.notifications.length > 10) state.notifications.shift();
-    }),
-
-    dismissNotification: (notifId) => set(state => {
-      state.notifications = state.notifications.filter(n => n.id !== notifId);
-    }),
-
-    // ==================== TREE ====================
-    toggleTreeNode: (nodeId) => set(state => {
-      const expanded = new Set(state.expandedNodes);
-      if (expanded.has(nodeId)) expanded.delete(nodeId);
-      else expanded.add(nodeId);
-      state.expandedNodes = expanded;
+      state.statusMessage = 'Rebuilding geometry...';
     }),
 
     // ==================== ASSEMBLY ====================
-    addComponent: (component) => set(state => {
-      state.assemblyComponents.push({
-        id: generateId('comp'),
-        ...component,
-      });
+    setAssemblyComponents: (components) => set(state => {
+      state.assemblyComponents = components;
     }),
 
-    addMate: (mate) => set(state => {
-      state.mates.push({
-        id: generateId('mate'),
-        ...mate,
-      });
+    setMates: (mates) => set(state => {
+      state.mates = mates;
     }),
 
-    // ==================== MEASUREMENTS ====================
-    addMeasurement: (measurement) => set(state => {
-      state.measurements.push({
-        id: generateId('measure'),
-        ...measurement,
-      });
+    insertAssemblyPart: (name, shapeType = 'box', dims = {}) => set(state => {
+      let geom;
+      if (shapeType === 'cylinder') {
+        const r = dims.radius || 10;
+        const h = dims.height || 30;
+        geom = new THREE.CylinderGeometry(r, r, h, 32);
+      } else if (shapeType === 'flange') {
+        geom = new THREE.CylinderGeometry(25, 25, 8, 32);
+      } else if (shapeType === 'pin') {
+        geom = new THREE.CylinderGeometry(6, 6, 40, 32);
+      } else {
+        const w = dims.width || 30;
+        const h = dims.height || 20;
+        const d = dims.depth || 30;
+        geom = new THREE.BoxGeometry(w, h, d);
+      }
+
+      const comp = assemblyManager.insertComponent(name || `Part_${state.assemblyComponents.length + 1}`, geom);
+      if (state.assemblyComponents.length > 0) {
+        // Offset subsequent components slightly so they don't visually overlap initially
+        comp.position.x = state.assemblyComponents.length * 35;
+        comp.updateMatrix();
+      }
+      state.assemblyComponents = [...assemblyManager.components];
+      state.statusMessage = `Inserted "${comp.name}" into assembly`;
     }),
 
-    clearMeasurements: () => set(state => {
-      state.measurements = [];
+    addAssemblyMate: (type, comp1Id, ref1, comp2Id, ref2, offset = 0) => set(state => {
+      const mate = assemblyManager.addMate(type, comp1Id, ref1, comp2Id, ref2, offset);
+      state.mates = [...assemblyManager.mates];
+      state.assemblyComponents = [...assemblyManager.components];
+      state.statusMessage = `Added ${type} mate between components`;
     }),
 
-    // ==================== MASS PROPERTIES ====================
-    setMassProperties: (props) => set(state => {
-      state.massProperties = props;
+    solveAssembly: () => set(state => {
+      const err = assemblyManager.solve();
+      state.assemblyComponents = [...assemblyManager.components];
+      state.statusMessage = `Assembly solved (residual: ${err.toFixed(5)}mm)`;
+    }),
+
+    clearAssembly: () => set(state => {
+      assemblyManager.components = [];
+      assemblyManager.mates = [];
+      state.assemblyComponents = [];
+      state.mates = [];
+      state.statusMessage = 'Cleared assembly';
     }),
 
     // ==================== PROJECT SAVE/LOAD ====================
     saveProject: () => {
       const state = get();
       const project = {
-        version: '1.0.0',
+        version: '2.0.0',
         documentName: state.documentName,
         appMode: state.appMode,
         features: state.features,
         sketchEntities: state.sketchEntities,
         sketchConstraints: state.sketchConstraints,
         sketchDimensions: state.sketchDimensions,
+        rollbackIndex: state.rollbackIndex,
         activeMaterial: state.activeMaterial,
         settings: state.settings,
         timestamp: Date.now(),
@@ -614,23 +622,40 @@ export const useCADStore = create(
 
     loadProject: (jsonString) => set(state => {
       try {
-        const project = JSON.parse(jsonString);
-        if (project.version) {
-          state.documentName = project.documentName || 'Imported Part';
-          state.appMode = project.appMode || APP_MODES.PART;
-          state.features = project.features || [];
-          state.sketchEntities = project.sketchEntities || {};
-          state.sketchConstraints = project.sketchConstraints || {};
-          state.sketchDimensions = project.sketchDimensions || {};
-          state.activeMaterial = project.activeMaterial || 'Steel_1020';
-          state.settings = { ...DEFAULT_SETTINGS, ...(project.settings || {}) };
-          state.needsRebuild = true;
-          state.isModified = false;
-          state.statusMessage = `Loaded: ${state.documentName}`;
-        }
+        const project = typeof jsonString === 'string' ? JSON.parse(jsonString) : jsonString;
+        state.documentName = project.documentName || 'Imported Part';
+        state.appMode = project.appMode || APP_MODES.PART;
+        state.features = project.features || [];
+        state.sketchEntities = project.sketchEntities || {};
+        state.sketchConstraints = project.sketchConstraints || {};
+        state.sketchDimensions = project.sketchDimensions || {};
+        state.rollbackIndex = project.rollbackIndex ?? (state.features.length - 1);
+        state.activeMaterial = project.activeMaterial || 'Steel_1020';
+        state.settings = { ...DEFAULT_SETTINGS, ...(project.settings || {}) };
+        state.undoStack = [];
+        state.redoStack = [];
+        state.needsRebuild = true;
+        state.isModified = false;
+        state.statusMessage = `Loaded: ${state.documentName}`;
       } catch (e) {
-        state.statusMessage = 'Error loading project';
+        state.statusMessage = 'Error loading project: ' + e.message;
       }
+    }),
+
+    loadExampleModel: (exampleData) => set(state => {
+      state._captureUndoSnapshot(state, `Load Example: ${exampleData.documentName}`);
+      state.documentName = exampleData.documentName || 'Example Part';
+      state.activeMaterial = exampleData.activeMaterial || 'Steel_1020';
+      state.features = JSON.parse(JSON.stringify(exampleData.features || []));
+      state.sketchEntities = JSON.parse(JSON.stringify(exampleData.sketchEntities || {}));
+      state.sketchConstraints = {};
+      state.sketchDimensions = {};
+      state.rollbackIndex = -1;
+      state.activeFeatureIndex = state.features.length > 0 ? 0 : -1;
+      state.isSketchActive = false;
+      state.activeSketchId = null;
+      state.needsRebuild = true;
+      state.statusMessage = `Loaded example: ${exampleData.documentName}`;
     }),
 
     newProject: () => set(state => {
@@ -643,11 +668,5 @@ export const useCADStore = create(
     setDocumentName: (name) => set(state => {
       state.documentName = name;
     }),
-
-    // ==================== REFS (non-immer) ====================
-    setCameraRef: (ref) => set({ cameraRef: ref }),
-    setControlsRef: (ref) => set({ controlsRef: ref }),
-    setSceneRef: (ref) => set({ sceneRef: ref }),
-    setRendererRef: (ref) => set({ rendererRef: ref }),
   }))
 );

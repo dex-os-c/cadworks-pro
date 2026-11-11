@@ -22,6 +22,8 @@ export default function PropertyPanel() {
   const [diameter, setDiameter] = useState(10);
   const [direction, setDirection] = useState('blind');
   const [flipDir, setFlipDir] = useState(false);
+  const [thin, setThin] = useState(false);
+  const [wallThickness, setWallThickness] = useState(2);
   const [selectedSketchId, setSelectedSketchId] = useState('');
 
   // Available sketches for feature references
@@ -35,14 +37,16 @@ export default function PropertyPanel() {
 
   useEffect(() => {
     if (propertyPanelContent) {
-      if (propertyPanelContent.depth) setDepth(propertyPanelContent.depth);
-      if (propertyPanelContent.angle) setAngle(propertyPanelContent.angle);
-      if (propertyPanelContent.radius) setRadius(propertyPanelContent.radius);
-      if (propertyPanelContent.thickness) setThickness(propertyPanelContent.thickness);
-      if (propertyPanelContent.diameter) setDiameter(propertyPanelContent.diameter);
+      if (propertyPanelContent.depth !== undefined) setDepth(propertyPanelContent.depth);
+      if (propertyPanelContent.angle !== undefined) setAngle(propertyPanelContent.angle);
+      if (propertyPanelContent.radius !== undefined) setRadius(propertyPanelContent.radius);
+      if (propertyPanelContent.thickness !== undefined) setThickness(propertyPanelContent.thickness);
+      if (propertyPanelContent.diameter !== undefined) setDiameter(propertyPanelContent.diameter);
       if (propertyPanelContent.sketchId) setSelectedSketchId(propertyPanelContent.sketchId);
       if (propertyPanelContent.direction) setDirection(propertyPanelContent.direction);
       if (propertyPanelContent.flip !== undefined) setFlipDir(propertyPanelContent.flip);
+      if (propertyPanelContent.thin !== undefined) setThin(propertyPanelContent.thin);
+      if (propertyPanelContent.wallThickness !== undefined) setWallThickness(propertyPanelContent.wallThickness);
     }
   }, [propertyPanelContent]);
 
@@ -65,6 +69,8 @@ export default function PropertyPanel() {
       diameter,
       direction,
       flip: flipDir,
+      thin,
+      wallThickness,
     };
 
     if (isEdit && featId) {
@@ -132,47 +138,68 @@ export default function PropertyPanel() {
 
         {/* Extrude parameters */}
         {(featureType === FEATURE_TYPES.EXTRUDE_BOSS || featureType === FEATURE_TYPES.EXTRUDE_CUT) && (
-          <div className="property-card">
-            <div className="property-card-header">Direction 1</div>
-            <div className="property-card-body">
-              {/* Segmented condition control */}
-              <div className="segmented-control">
-                <button
-                  className={`segment-btn ${direction === 'blind' ? 'active' : ''}`}
-                  onClick={() => setDirection('blind')}
-                >
-                  Blind
-                </button>
-                <button
-                  className={`segment-btn ${direction === 'midplane' ? 'active' : ''}`}
-                  onClick={() => setDirection('midplane')}
-                >
-                  Mid Plane
-                </button>
-                <button
-                  className={`segment-btn ${direction === 'throughall' ? 'active' : ''}`}
-                  onClick={() => setDirection('throughall')}
-                >
-                  Through All
-                </button>
-              </div>
-
-              {direction !== 'throughall' && (
-                <div className="property-row">
-                  <span className="property-label">Extrude Depth (D1):</span>
-                  <NumericInput value={depth} onChange={setDepth} min={0.5} max={5000} step={5} unit="mm" />
+          <>
+            <div className="property-card">
+              <div className="property-card-header">Direction 1</div>
+              <div className="property-card-body">
+                {/* Segmented condition control */}
+                <div className="segmented-control">
+                  <button
+                    className={`segment-btn ${direction === 'blind' ? 'active' : ''}`}
+                    onClick={() => setDirection('blind')}
+                  >
+                    Blind
+                  </button>
+                  <button
+                    className={`segment-btn ${direction === 'midplane' ? 'active' : ''}`}
+                    onClick={() => setDirection('midplane')}
+                  >
+                    Mid Plane
+                  </button>
+                  <button
+                    className={`segment-btn ${direction === 'throughall' ? 'active' : ''}`}
+                    onClick={() => setDirection('throughall')}
+                  >
+                    Through All
+                  </button>
                 </div>
-              )}
 
-              <div className="property-row switch-row">
-                <span className="property-label">Reverse Extrude Direction</span>
-                <label className="custom-switch">
-                  <input type="checkbox" checked={flipDir} onChange={(e) => setFlipDir(e.target.checked)} />
+                {direction !== 'throughall' && (
+                  <div className="property-row">
+                    <span className="property-label">Extrude Depth (D1):</span>
+                    <NumericInput value={depth} onChange={setDepth} min={0.5} max={5000} step={5} unit="mm" />
+                  </div>
+                )}
+
+                <div className="property-row switch-row">
+                  <span className="property-label">Reverse Extrude Direction</span>
+                  <label className="custom-switch">
+                    <input type="checkbox" checked={flipDir} onChange={(e) => setFlipDir(e.target.checked)} />
+                    <span className="slider round" />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {/* Thin Feature Card */}
+            <div className="property-card">
+              <div className="property-card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>Thin Feature</span>
+                <label className="custom-switch" style={{ width: 34, height: 18 }}>
+                  <input type="checkbox" checked={thin} onChange={(e) => setThin(e.target.checked)} />
                   <span className="slider round" />
                 </label>
               </div>
+              {thin && (
+                <div className="property-card-body">
+                  <div className="property-row">
+                    <span className="property-label">Wall Thickness (T1):</span>
+                    <NumericInput value={wallThickness} onChange={setWallThickness} min={0.2} max={100} step={0.5} unit="mm" />
+                  </div>
+                </div>
+              )}
             </div>
-          </div>
+          </>
         )}
 
         {/* Revolve parameters */}

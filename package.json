@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js --host 0.0.0.0",
     "build": "node ./node_modules/vite/bin/vite.js build",
-    "preview": "node ./node_modules/vite/bin/vite.js preview --host 0.0.0.0"
+    "preview": "node ./node_modules/vite/bin/vite.js preview --host 0.0.0.0",
+    "test": "node --test tests/cadworks.test.js"
   },
   "dependencies": {
     "react": "^18.2.0",
