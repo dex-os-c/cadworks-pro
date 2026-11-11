@@ -3,8 +3,16 @@ import { TOOLS } from './constants';
 
 export function setupKeyboardShortcuts(store) {
   const handleKeyDown = (e) => {
-    // Ignore keystrokes when typing into text/numeric input fields
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') {
+    // Ignore keystrokes when typing into text/numeric input fields or contenteditable elements
+    const target = e.target;
+    if (
+      target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'SELECT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable ||
+        (target.closest && target.closest('input, select, textarea, [contenteditable="true"]')))
+    ) {
       return;
     }
 

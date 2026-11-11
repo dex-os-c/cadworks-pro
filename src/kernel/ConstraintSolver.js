@@ -22,22 +22,45 @@ import { CONSTRAINT_TYPES } from '../utils/constants.js';
  */
 export class QRDecomposition {
   constructor(A, enablePivoting = true) {
+    if (!A || A.length === 0 || !A[0] || A[0].length === 0) {
+      this.m = 0;
+      this.n = 0;
+      this.QR = [];
+      this.p = new Int32Array(0);
+      this.beta = new Float64Array(0);
+      this.rank = 0;
+      this.tolerance = 0;
+      return;
+    }
+
     const m = A.length;
     const n = A[0].length;
     this.m = m;
     this.n = n;
 
-    // Working copy of A
-    const QR = Array.from({ length: m }, (_, i) => new Float64Array(A[i]));
+    // Working copy of A with sanitized finite numbers
+    const QR = Array.from({ length: m }, (_, i) => {
+      const row = new Float64Array(n);
+      if (A[i]) {
+        for (let j = 0; j < n; j++) {
+          const val = A[i][j];
+          row[j] = Number.isFinite(val) ? val : 0;
+        }
+      }
+      return row;
+    });
+
     const p = new Int32Array(n);
     for (let j = 0; j < n; j++) p[j] = j;
 
     const colNormsSq = new Float64Array(n);
+    const origColNormsSq = new Float64Array(n);
     if (enablePivoting) {
       for (let j = 0; j < n; j++) {
         let sum = 0;
         for (let i = 0; i < m; i++) sum += QR[i][j] * QR[i][j];
         colNormsSq[j] = sum;
+        origColNormsSq[j] = sum;
       }
     }
 
@@ -67,9 +90,14 @@ export class QRDecomposition {
           const tmpP = p[k];
           p[k] = p[maxCol];
           p[maxCol] = tmpP;
-          // Swap norm
-          colNormsSq[maxCol] = colNormsSq[k];
-          colNormsSq[k] = maxNormSq;
+          // Swap norm tracking
+          const tmpNorm = colNormsSq[k];
+          colNormsSq[k] = colNormsSq[maxCol];
+          colNormsSq[maxCol] = tmpNorm;
+
+          const tmpOrig = origColNormsSq[k];
+          origColNormsSq[k] = origColNormsSq[maxCol];
+          origColNormsSq[maxCol] = tmpOrig;
         }
       }
 
@@ -78,7 +106,7 @@ export class QRDecomposition {
       for (let i = k; i < m; i++) normSq += QR[i][k] * QR[i][k];
       const norm = Math.sqrt(normSq);
 
-      if (norm < 1e-15) {
+      if (norm < 1e-15 || !Number.isFinite(norm)) {
         beta[k] = 0;
         continue;
       }
@@ -86,6 +114,11 @@ export class QRDecomposition {
       const alpha = QR[k][k];
       const sigma = alpha >= 0 ? -norm : norm;
       const v0 = alpha - sigma;
+
+      if (Math.abs(v0) < 1e-15 || !Number.isFinite(v0)) {
+        beta[k] = 0;
+        continue;
+      }
 
       // Store Householder vector in QR[k...m-1][k] scaled by v0
       QR[k][k] = sigma;
@@ -108,7 +141,16 @@ export class QRDecomposition {
         }
 
         if (enablePivoting) {
+          // Downdate column norm squared
           colNormsSq[j] = Math.max(0, colNormsSq[j] - QR[k][j] * QR[k][j]);
+          // Guard against catastrophic cancellation: recompute from remaining elements
+          if (colNormsSq[j] < 1e-12 || colNormsSq[j] < 1e-4 * origColNormsSq[j]) {
+            let sum = 0;
+            for (let i = k + 1; i < m; i++) {
+              sum += QR[i][j] * QR[i][j];
+            }
+            colNormsSq[j] = sum;
+          }
         }
       }
     }
@@ -117,11 +159,21 @@ export class QRDecomposition {
     this.p = p;
     this.beta = beta;
 
-    // Evaluate numerical rank
-    const tol = Math.max(m, n) * 1e-12 * (Math.abs(QR[0][0]) || 1.0);
+    // Evaluate numerical rank with machine epsilon handling
+    const eps = Number.EPSILON;
+    const maxDiag = Math.abs(QR[0]?.[0]) || 0;
+    const tol = Math.max(
+      Math.max(m, n) * eps * 100 * (maxDiag || 1.0),
+      1e-10 * (maxDiag || 1.0),
+      1e-12
+    );
+    this.tolerance = tol;
+
     let rank = 0;
-    for (let i = 0; i < minDim; i++) {
-      if (Math.abs(QR[i][i]) > tol) rank++;
+    if (maxDiag > 1e-14) {
+      for (let i = 0; i < minDim; i++) {
+        if (Math.abs(QR[i][i]) > tol) rank++;
+      }
     }
     this.rank = rank;
   }
@@ -132,13 +184,21 @@ export class QRDecomposition {
    * @returns {Float64Array} x - Solution vector (length n)
    */
   solve(b) {
-    const { m, n, QR, beta, p, rank } = this;
+    const { m, n, QR, beta, p, tolerance } = this;
+    if (n === 0) return new Float64Array(0);
+    if (!b || typeof b.length !== 'number' || b.length === 0) return new Float64Array(n);
+
     const minDim = Math.min(m, n);
 
     // Compute Q^T * b in place
-    const d = new Float64Array(b);
+    const d = new Float64Array(m);
+    for (let i = 0; i < Math.min(b.length, m); i++) {
+      const val = b[i];
+      d[i] = Number.isFinite(val) ? val : 0;
+    }
+
     for (let k = 0; k < minDim; k++) {
-      if (beta[k] === 0) continue;
+      if (beta[k] === 0 || !Number.isFinite(beta[k])) continue;
       let dot = d[k];
       for (let i = k + 1; i < m; i++) {
         dot += QR[i][k] * d[i];
@@ -153,10 +213,10 @@ export class QRDecomposition {
 
     // Back-substitution on R * y = d[0:n]
     const y = new Float64Array(n);
-    const tol = Math.max(m, n) * 1e-12 * (Math.abs(QR[0][0]) || 1.0);
+    const tol = tolerance || (Math.max(m, n) * 1e-12 * (Math.abs(QR[0]?.[0]) || 1.0));
 
-    for (let i = Math.min(rank, n) - 1; i >= 0; i--) {
-      if (Math.abs(QR[i][i]) < tol) {
+    for (let i = minDim - 1; i >= 0; i--) {
+      if (Math.abs(QR[i][i]) <= tol || !Number.isFinite(QR[i][i])) {
         y[i] = 0;
         continue;
       }
@@ -164,7 +224,8 @@ export class QRDecomposition {
       for (let j = i + 1; j < n; j++) {
         sum -= QR[i][j] * y[j];
       }
-      y[i] = sum / QR[i][i];
+      const sol = sum / QR[i][i];
+      y[i] = Number.isFinite(sol) ? sol : 0;
     }
 
     // Apply column permutation x = P * y
@@ -272,13 +333,16 @@ export class ConstraintSolver {
     const X0 = new Float64Array(nVars);
     const X = new Float64Array(nVars);
     for (let i = 0; i < nVars; i++) {
-      X[i] = varMap[i].obj[varMap[i].key];
+      const val = varMap[i].obj[varMap[i].key];
+      X[i] = Number.isFinite(val) ? val : 0;
       X0[i] = X[i];
     }
 
     const setVars = (vec) => {
       for (let i = 0; i < nVars; i++) {
-        varMap[i].obj[varMap[i].key] = vec[i];
+        if (Number.isFinite(vec[i])) {
+          varMap[i].obj[varMap[i].key] = vec[i];
+        }
       }
     };
 
@@ -308,8 +372,10 @@ export class ConstraintSolver {
 
     let currentError = this._normInf(r);
 
-    // Levenberg-Marquardt parameters
+    // Levenberg-Marquardt parameters with robust singularity bounds
     let lambda = 1e-3;
+    const minLambda = 1e-12;
+    const maxLambda = 1e10;
     const mu = 1e-9; // Tikhonov regularization towards initial geometry
     let iter = 0;
 
@@ -321,6 +387,7 @@ export class ConstraintSolver {
       // 3. Central-difference numerical Jacobian J (mConstraints x nVars)
       const J = Array.from({ length: mConstraints }, () => new Float64Array(nVars));
       const h = 1e-7;
+      const twoH = 2.0 * h;
 
       for (let j = 0; j < nVars; j++) {
         const orig = X[j];
@@ -333,9 +400,9 @@ export class ConstraintSolver {
         setVars(X);
         const rMinus = evaluateResiduals().residuals;
 
-        const twoH = 2.0 * h;
         for (let i = 0; i < mConstraints; i++) {
-          J[i][j] = (rPlus[i] - rMinus[i]) / twoH;
+          const diff = (rPlus[i] - rMinus[i]) / twoH;
+          J[i][j] = Number.isFinite(diff) ? diff : 0;
         }
 
         X[j] = orig;
@@ -357,14 +424,14 @@ export class ConstraintSolver {
       }
 
       // Fill Levenberg damping sqrt(lambda) * I
-      const sqrtLambda = Math.sqrt(lambda);
+      const sqrtLambda = Math.sqrt(Math.max(minLambda, lambda));
       for (let j = 0; j < nVars; j++) {
         A_aug[mConstraints + j][j] = sqrtLambda;
         b_aug[mConstraints + j] = 0;
       }
 
       // Fill Tikhonov regularization sqrt(mu) * I towards initial configuration X0
-      const sqrtMu = Math.sqrt(mu);
+      const sqrtMu = Math.sqrt(Math.max(1e-15, mu));
       for (let j = 0; j < nVars; j++) {
         A_aug[mConstraints + nVars + j][j] = sqrtMu;
         b_aug[mConstraints + nVars + j] = -sqrtMu * (X[j] - X0[j]);
@@ -373,6 +440,31 @@ export class ConstraintSolver {
       // Solve augmented system with QR Decomposition
       const qrAug = new QRDecomposition(A_aug, true);
       const delta = qrAug.solve(b_aug);
+
+      // Validate delta against singularity explosion or NaNs
+      let isDeltaValid = true;
+      let deltaNormSq = 0;
+      for (let i = 0; i < nVars; i++) {
+        if (!Number.isFinite(delta[i])) {
+          isDeltaValid = false;
+          break;
+        }
+        deltaNormSq += delta[i] * delta[i];
+      }
+
+      if (!isDeltaValid) {
+        // Reject step & increase damping significantly
+        lambda = Math.min(maxLambda, lambda * 10.0);
+        continue;
+      }
+
+      // Trust-region step limit to prevent matrix explosion
+      const deltaNorm = Math.sqrt(deltaNormSq);
+      const maxStep = 200.0;
+      if (deltaNorm > maxStep) {
+        const scale = maxStep / deltaNorm;
+        for (let i = 0; i < nVars; i++) delta[i] *= scale;
+      }
 
       // 5. Test step
       const X_trial = new Float64Array(nVars);
@@ -384,17 +476,21 @@ export class ConstraintSolver {
       const trialEval = evaluateResiduals();
       const trialError = this._normInf(trialEval.residuals);
 
-      if (trialError < currentError) {
+      if (Number.isFinite(trialError) && trialError < currentError) {
         // Accept step
         for (let i = 0; i < nVars; i++) X[i] = X_trial[i];
         r = trialEval.residuals;
         constraintRowMap = trialEval.constraintRowMap;
         currentError = trialError;
-        lambda = Math.max(1e-9, lambda * 0.4);
+        lambda = Math.max(minLambda, lambda * 0.4);
       } else {
         // Reject step & increase damping
         setVars(X);
-        lambda = Math.min(1e8, lambda * 5.0);
+        lambda = Math.min(maxLambda, lambda * 5.0);
+        if (deltaNorm < 1e-14) {
+          // Numerical limit reached: no further progress possible
+          break;
+        }
       }
     }
 
@@ -404,6 +500,8 @@ export class ConstraintSolver {
     const mConstraints = r.length;
     const finalJ = Array.from({ length: mConstraints }, () => new Float64Array(nVars));
     const h = 1e-7;
+    const twoH = 2.0 * h;
+
     for (let j = 0; j < nVars; j++) {
       const orig = X[j];
       X[j] = orig + h;
@@ -413,7 +511,8 @@ export class ConstraintSolver {
       setVars(X);
       const rMinus = evaluateResiduals().residuals;
       for (let i = 0; i < mConstraints; i++) {
-        finalJ[i][j] = (rPlus[i] - rMinus[i]) / (2.0 * h);
+        const diff = (rPlus[i] - rMinus[i]) / twoH;
+        finalJ[i][j] = Number.isFinite(diff) ? diff : 0;
       }
       X[j] = orig;
     }
@@ -520,8 +619,9 @@ export class ConstraintSolver {
             // Point on line
             const dx = e2.p2.x - e2.p1.x;
             const dy = e2.p2.y - e2.p1.y;
-            const len = Math.hypot(dx, dy) || 1.0;
-            const dist = ((p1.x - e2.p1.x) * dy - (p1.y - e2.p1.y) * dx) / len;
+            const len = Math.hypot(dx, dy);
+            const safeLen = len < 1e-6 ? Math.sqrt(dx * dx + dy * dy + 1e-6) : len;
+            const dist = ((p1.x - e2.p1.x) * dy - (p1.y - e2.p1.y) * dx) / safeLen;
             residuals.push(dist);
           } else if (p1 && e2.center && e2.radius !== undefined) {
             // Point on circle
@@ -563,10 +663,16 @@ export class ConstraintSolver {
             const dy1 = e1.p2.y - e1.p1.y;
             const dx2 = e2.p2.x - e2.p1.x;
             const dy2 = e2.p2.y - e2.p1.y;
-            const len1 = Math.hypot(dx1, dy1) || 1.0;
-            const len2 = Math.hypot(dx2, dy2) || 1.0;
-            // Normalized cross product
-            residuals.push((dx1 * dy2 - dy1 * dx2) / (len1 * len2));
+            const len1 = Math.hypot(dx1, dy1);
+            const len2 = Math.hypot(dx2, dy2);
+            // Handle degenerate line segments smoothly without singularity
+            if (len1 < 1e-6 || len2 < 1e-6) {
+              const eps = 1e-3;
+              const denom = Math.sqrt((dx1 * dx1 + dy1 * dy1 + eps * eps) * (dx2 * dx2 + dy2 * dy2 + eps * eps));
+              residuals.push((dx1 * dy2 - dy1 * dx2) / denom);
+            } else {
+              residuals.push((dx1 * dy2 - dy1 * dx2) / (len1 * len2));
+            }
           }
           break;
         }
@@ -577,10 +683,16 @@ export class ConstraintSolver {
             const dy1 = e1.p2.y - e1.p1.y;
             const dx2 = e2.p2.x - e2.p1.x;
             const dy2 = e2.p2.y - e2.p1.y;
-            const len1 = Math.hypot(dx1, dy1) || 1.0;
-            const len2 = Math.hypot(dx2, dy2) || 1.0;
-            // Normalized dot product
-            residuals.push((dx1 * dx2 + dy1 * dy2) / (len1 * len2));
+            const len1 = Math.hypot(dx1, dy1);
+            const len2 = Math.hypot(dx2, dy2);
+            // Handle degenerate line segments smoothly without singularity
+            if (len1 < 1e-6 || len2 < 1e-6) {
+              const eps = 1e-3;
+              const denom = Math.sqrt((dx1 * dx1 + dy1 * dy1 + eps * eps) * (dx2 * dx2 + dy2 * dy2 + eps * eps));
+              residuals.push((dx1 * dx2 + dy1 * dy2) / denom);
+            } else {
+              residuals.push((dx1 * dx2 + dy1 * dy2) / (len1 * len2));
+            }
           }
           break;
         }
@@ -622,15 +734,23 @@ export class ConstraintSolver {
           if (e1 && e2 && e1.p1 && e1.p2 && e2.p1 && e2.p2) {
             const dx1 = e1.p2.x - e1.p1.x;
             const dy1 = e1.p2.y - e1.p1.y;
-            const len1 = Math.hypot(dx1, dy1) || 1.0;
+            const len1 = Math.hypot(dx1, dy1);
             const dx2 = e2.p2.x - e2.p1.x;
             const dy2 = e2.p2.y - e2.p1.y;
-            const len2 = Math.hypot(dx2, dy2) || 1.0;
+            const len2 = Math.hypot(dx2, dy2);
 
-            // 1. Parallel directions
-            residuals.push((dx1 * dy2 - dy1 * dx2) / (len1 * len2));
-            // 2. Point e2.p1 lies on line e1
-            residuals.push(((e2.p1.x - e1.p1.x) * dy1 - (e2.p1.y - e1.p1.y) * dx1) / len1);
+            if (len1 < 1e-6 || len2 < 1e-6) {
+              const eps = 1e-3;
+              const denom = Math.sqrt((dx1 * dx1 + dy1 * dy1 + eps * eps) * (dx2 * dx2 + dy2 * dy2 + eps * eps));
+              residuals.push((dx1 * dy2 - dy1 * dx2) / denom);
+              const safeLen1 = Math.sqrt(dx1 * dx1 + dy1 * dy1 + eps * eps);
+              residuals.push(((e2.p1.x - e1.p1.x) * dy1 - (e2.p1.y - e1.p1.y) * dx1) / safeLen1);
+            } else {
+              // 1. Parallel directions
+              residuals.push((dx1 * dy2 - dy1 * dx2) / (len1 * len2));
+              // 2. Point e2.p1 lies on line e1
+              residuals.push(((e2.p1.x - e1.p1.x) * dy1 - (e2.p1.y - e1.p1.y) * dx1) / len1);
+            }
           }
           break;
         }
@@ -645,8 +765,9 @@ export class ConstraintSolver {
             if (line && circle) {
               const dx = line.p2.x - line.p1.x;
               const dy = line.p2.y - line.p1.y;
-              const len = Math.hypot(dx, dy) || 1.0;
-              const dist = ((circle.center.x - line.p1.x) * dy - (circle.center.y - line.p1.y) * dx) / len;
+              const len = Math.hypot(dx, dy);
+              const safeLen = len < 1e-6 ? Math.sqrt(dx * dx + dy * dy + 1e-6) : len;
+              const dist = ((circle.center.x - line.p1.x) * dy - (circle.center.y - line.p1.y) * dx) / safeLen;
               const meta = constraintMeta.get(c.id);
               const side = meta ? meta.side : 1;
               residuals.push(dist - side * (circle.radius ?? 10));
@@ -670,18 +791,19 @@ export class ConstraintSolver {
           if (p1 && p2 && axisLine && axisLine.p1 && axisLine.p2) {
             const adx = axisLine.p2.x - axisLine.p1.x;
             const ady = axisLine.p2.y - axisLine.p1.y;
-            const alen = Math.hypot(adx, ady) || 1.0;
+            const alen = Math.hypot(adx, ady);
+            const safeAlen = alen < 1e-6 ? Math.sqrt(adx * adx + ady * ady + 1e-6) : alen;
 
             // 1. Midpoint of p1 and p2 lies on axis line
             const mx = 0.5 * (p1.x + p2.x);
             const my = 0.5 * (p1.y + p2.y);
-            const distMid = ((mx - axisLine.p1.x) * ady - (my - axisLine.p1.y) * adx) / alen;
+            const distMid = ((mx - axisLine.p1.x) * ady - (my - axisLine.p1.y) * adx) / safeAlen;
             residuals.push(distMid);
 
             // 2. Vector (p2 - p1) is perpendicular to axis line
             const vdx = p2.x - p1.x;
             const vdy = p2.y - p1.y;
-            residuals.push((vdx * adx + vdy * ady) / alen);
+            residuals.push((vdx * adx + vdy * ady) / safeAlen);
           }
           break;
         }
@@ -730,8 +852,9 @@ export class ConstraintSolver {
               // Point to line distance
               const dx = e2.p2.x - e2.p1.x;
               const dy = e2.p2.y - e2.p1.y;
-              const len = Math.hypot(dx, dy) || 1.0;
-              const dist = Math.abs((p1.x - e2.p1.x) * dy - (p1.y - e2.p1.y) * dx) / len;
+              const len = Math.hypot(dx, dy);
+              const safeLen = len < 1e-6 ? Math.sqrt(dx * dx + dy * dy + 1e-6) : len;
+              const dist = Math.abs((p1.x - e2.p1.x) * dy - (p1.y - e2.p1.y) * dx) / safeLen;
               residuals.push(dist - targetVal);
             }
           } else if (e1) {
@@ -751,26 +874,38 @@ export class ConstraintSolver {
             const dy1 = e1.p2.y - e1.p1.y;
             const dx2 = e2.p2.x - e2.p1.x;
             const dy2 = e2.p2.y - e2.p1.y;
-            const len1 = Math.hypot(dx1, dy1) || 1e-6;
-            const len2 = Math.hypot(dx2, dy2) || 1e-6;
+            const len1 = Math.hypot(dx1, dy1);
+            const len2 = Math.hypot(dx2, dy2);
 
-            const u1x = dx1 / len1;
-            const u1y = dy1 / len1;
-            const u2x = dx2 / len2;
-            const u2y = dy2 / len2;
+            if (len1 < 1e-6 || len2 < 1e-6) {
+              // Degenerate zero-length segment: use smooth regularized angle residual
+              // to prevent gradient explosion and singular Jacobian
+              const eps = 1e-3;
+              const denom = Math.sqrt((dx1 * dx1 + dy1 * dy1 + eps * eps) * (dx2 * dx2 + dy2 * dy2 + eps * eps));
+              const cross = dx1 * dy2 - dy1 * dx2;
+              const dot = dx1 * dx2 + dy1 * dy2;
+              const targetDeg = c.angle ?? c.value ?? 90;
+              const targetRad = (targetDeg * Math.PI) / 180;
+              residuals.push((cross * Math.cos(targetRad) - dot * Math.sin(targetRad)) / denom);
+            } else {
+              const u1x = dx1 / len1;
+              const u1y = dy1 / len1;
+              const u2x = dx2 / len2;
+              const u2y = dy2 / len2;
 
-            const cosA = u1x * u2x + u1y * u2y;
-            const sinA = u1x * u2y - u1y * u2x;
-            const currentAngle = Math.atan2(sinA, cosA);
+              const cosA = Math.max(-1, Math.min(1, u1x * u2x + u1y * u2y));
+              const sinA = Math.max(-1, Math.min(1, u1x * u2y - u1y * u2x));
+              const currentAngle = Math.atan2(sinA, cosA);
 
-            const targetDeg = c.angle ?? c.value ?? 90;
-            const targetRad = (targetDeg * Math.PI) / 180;
+              const targetDeg = c.angle ?? c.value ?? 90;
+              const targetRad = (targetDeg * Math.PI) / 180;
 
-            // Angle difference wrapped to [-PI, PI]
-            let diff = currentAngle - targetRad;
-            while (diff > Math.PI) diff -= 2 * Math.PI;
-            while (diff < -Math.PI) diff += 2 * Math.PI;
-            residuals.push(diff);
+              // Angle difference wrapped to [-PI, PI]
+              let diff = currentAngle - targetRad;
+              while (diff > Math.PI) diff -= 2 * Math.PI;
+              while (diff < -Math.PI) diff += 2 * Math.PI;
+              residuals.push(diff);
+            }
           }
           break;
         }
@@ -827,10 +962,15 @@ export class ConstraintSolver {
       if (rows.length === 0) continue;
 
       let isRedundant = true;
+      let hasActiveRow = false;
+
       for (const row of rows) {
         const grad = new Float64Array(J[row]);
-        const gradNorm = Math.hypot(...grad);
+        let gradNormSq = 0;
+        for (let k = 0; k < grad.length; k++) gradNormSq += grad[k] * grad[k];
+        const gradNorm = Math.sqrt(gradNormSq);
         if (gradNorm < 1e-8) continue;
+        hasActiveRow = true;
 
         // Project grad onto existing basis
         const proj = new Float64Array(grad);
@@ -840,7 +980,10 @@ export class ConstraintSolver {
           for (let k = 0; k < grad.length; k++) proj[k] -= dot * b[k];
         }
 
-        const projNorm = Math.hypot(...proj);
+        let projNormSq = 0;
+        for (let k = 0; k < proj.length; k++) projNormSq += proj[k] * proj[k];
+        const projNorm = Math.sqrt(projNormSq);
+
         if (projNorm > 1e-4 * gradNorm) {
           // Independent component exists
           isRedundant = false;
@@ -851,8 +994,8 @@ export class ConstraintSolver {
         }
       }
 
-      // If all rows of this constraint are linearly dependent on previous constraints
-      if (isRedundant && rows.length > 0) {
+      // If all active rows of this constraint are linearly dependent on previous constraints
+      if (isRedundant && hasActiveRow && rows.length > 0) {
         let maxRes = 0;
         for (const row of rows) {
           const res = Math.abs(residuals[row] || 0);

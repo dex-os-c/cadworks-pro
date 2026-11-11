@@ -24,6 +24,9 @@ import {
   SphereSurface,
   CURVE_TYPES,
   SURFACE_TYPES,
+  safeNormalize,
+  sanitizePoint,
+  removeConsecutiveDuplicates,
 } from './Topology.js';
 import {
   createSolidBox,
@@ -52,8 +55,8 @@ import {
  */
 class CSGVertex {
   constructor(pos, normal) {
-    this.pos = pos.clone();
-    this.normal = normal.clone();
+    this.pos = sanitizePoint(pos);
+    this.normal = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
   }
 
   clone() {
@@ -65,10 +68,10 @@ class CSGVertex {
   }
 
   interpolate(other, t) {
-    return new CSGVertex(
-      this.pos.clone().lerp(other.pos, t),
-      this.normal.clone().lerp(other.normal, t).normalize()
-    );
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+    const p = this.pos.clone().lerp(other.pos, clampedT);
+    const n = this.normal.clone().lerp(other.normal, clampedT);
+    return new CSGVertex(p, safeNormalize(n, this.normal));
   }
 }
 
@@ -77,11 +80,31 @@ class CSGVertex {
  */
 class CSGPolygon {
   constructor(vertices, shared = null) {
-    this.vertices = vertices;
+    const cleaned = [];
+    for (let i = 0; i < vertices.length; i++) {
+      const v = vertices[i];
+      if (!cleaned.length || v.pos.distanceTo(cleaned[cleaned.length - 1].pos) > 1e-6) {
+        cleaned.push(v);
+      }
+    }
+    if (cleaned.length > 1 && cleaned[0].pos.distanceTo(cleaned[cleaned.length - 1].pos) <= 1e-6) {
+      cleaned.pop();
+    }
+    this.vertices = cleaned.length >= 3 ? cleaned : vertices;
     this.shared = shared;
-    this.plane = CSGPlane.fromPoints(
-      vertices[0].pos, vertices[1].pos, vertices[2].pos
-    );
+    this.plane = CSGPlane.fromVertices(this.vertices);
+  }
+
+  computeArea() {
+    if (this.vertices.length < 3) return 0;
+    let areaVec = new THREE.Vector3(0, 0, 0);
+    for (let i = 0; i < this.vertices.length; i++) {
+      const v0 = this.vertices[i].pos;
+      const v1 = this.vertices[(i + 1) % this.vertices.length].pos;
+      areaVec.add(new THREE.Vector3().crossVectors(v0, v1));
+    }
+    const a = areaVec.dot(this.plane.normal) * 0.5;
+    return isNaN(a) ? 0 : Math.abs(a);
   }
 
   clone() {
@@ -102,18 +125,35 @@ class CSGPolygon {
  */
 class CSGPlane {
   constructor(normal, w) {
-    this.normal = normal;
-    this.w = w;
+    this.normal = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
+    this.w = typeof w === 'number' && !isNaN(w) && isFinite(w) ? w : 0;
   }
 
   static fromPoints(a, b, c) {
-    const n = new THREE.Vector3()
-      .crossVectors(
-        new THREE.Vector3().subVectors(b, a),
-        new THREE.Vector3().subVectors(c, a)
-      )
-      .normalize();
-    return new CSGPlane(n, n.dot(a));
+    const ab = new THREE.Vector3().subVectors(b, a);
+    const ac = new THREE.Vector3().subVectors(c, a);
+    const n = new THREE.Vector3().crossVectors(ab, ac);
+    const norm = safeNormalize(n, new THREE.Vector3(0, 0, 1));
+    return new CSGPlane(norm, norm.dot(a));
+  }
+
+  static fromVertices(vertices) {
+    if (!vertices || vertices.length < 3) {
+      return new CSGPlane(new THREE.Vector3(0, 0, 1), 0);
+    }
+    const normal = new THREE.Vector3(0, 0, 0);
+    const center = new THREE.Vector3(0, 0, 0);
+    for (let i = 0; i < vertices.length; i++) {
+      const curr = vertices[i].pos;
+      const next = vertices[(i + 1) % vertices.length].pos;
+      normal.x += (curr.y - next.y) * (curr.z + next.z);
+      normal.y += (curr.z - next.z) * (curr.x + next.x);
+      normal.z += (curr.x - next.x) * (curr.y + next.y);
+      center.add(curr);
+    }
+    center.divideScalar(vertices.length);
+    const norm = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
+    return new CSGPlane(norm, norm.dot(center));
   }
 
   clone() {
@@ -134,7 +174,7 @@ class CSGPlane {
     const FRONT = 1;
     const BACK = 2;
     const SPANNING = 3;
-    const CSG_EPSILON = 1e-5;
+    const CSG_EPSILON = 1e-4;
 
     let polygonType = 0;
     const types = [];
@@ -171,16 +211,24 @@ class CSGPlane {
           if (ti !== FRONT) b.push(ti !== BACK ? vi.clone() : vi);
 
           if ((ti | tj) === SPANNING) {
-            const t =
-              (this.w - this.normal.dot(vi.pos)) /
-              this.normal.dot(new THREE.Vector3().subVectors(vj.pos, vi.pos));
-            const v = vi.interpolate(vj, t);
+            const denom = this.normal.dot(new THREE.Vector3().subVectors(vj.pos, vi.pos));
+            const t = Math.abs(denom) > 1e-9
+              ? (this.w - this.normal.dot(vi.pos)) / denom
+              : 0;
+            const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+            const v = vi.interpolate(vj, clampedT);
             f.push(v);
             b.push(v.clone());
           }
         }
-        if (f.length >= 3) front.push(new CSGPolygon(f, polygon.shared));
-        if (b.length >= 3) back.push(new CSGPolygon(b, polygon.shared));
+        if (f.length >= 3) {
+          const polyF = new CSGPolygon(f, polygon.shared);
+          if (polyF.computeArea() > 1e-9) front.push(polyF);
+        }
+        if (b.length >= 3) {
+          const polyB = new CSGPolygon(b, polygon.shared);
+          if (polyB.computeArea() > 1e-9) back.push(polyB);
+        }
         break;
       }
     }
@@ -697,21 +745,20 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   applyFillet(geometry, edgeIndices, radius) {
+    if (!geometry) return new THREE.BufferGeometry();
+    if (typeof radius !== 'number' || isNaN(radius) || radius <= 0) return geometry.clone();
+
     // Extract edge information from the geometry
     const edges = this._extractEdges(geometry);
     const posAttr = geometry.getAttribute('position');
+    if (!posAttr || posAttr.count === 0) return geometry.clone();
+
     const vertices = [];
     for (let i = 0; i < posAttr.count; i++) {
       vertices.push(new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)));
     }
 
-    // For each selected edge, compute rounded vertices
     const filletSegments = 8;
-    const newPositions = [];
-    const newNormals = [];
-    const processedEdges = new Set();
-
-    // Get the triangles from the geometry
     const indexAttr = geometry.index;
     const triangles = [];
     if (indexAttr) {
@@ -755,17 +802,22 @@ class GeometryEngine {
       const n2 = this._computeTriangleNormal(triangles[adjacentTris[1]], vertices);
 
       // Compute the dihedral angle
-      const dotProduct = n1.dot(n2);
-      if (dotProduct > 0.999) continue; // Nearly flat, skip
+      const dotProduct = Math.max(-1, Math.min(1, n1.dot(n2)));
+      if (dotProduct > 0.95 || dotProduct < -0.95) continue; // Nearly flat or opposite, skip
 
       // Edge direction
       const edgeStart = vertices[edge[0]].clone();
       const edgeEnd = vertices[edge[1]].clone();
-      const edgeDir = new THREE.Vector3().subVectors(edgeEnd, edgeStart).normalize();
       const edgeLength = edgeStart.distanceTo(edgeEnd);
+      if (edgeLength < 1e-4) continue;
+
+      // Ensure radius does not exceed adjacent edge lengths
+      const maxSafeRadius = edgeLength * 0.45;
+      const safeRadius = Math.min(radius, maxSafeRadius);
+      if (safeRadius < 1e-4) continue;
 
       // Create fillet arc perpendicular to the edge
-      const arcPoints = this._computeFilletArc(edgeStart, edgeEnd, n1, n2, radius, filletSegments);
+      const arcPoints = this._computeFilletArc(edgeStart, edgeEnd, n1, n2, safeRadius, filletSegments);
 
       // Build a tube-like fillet strip along the edge
       if (arcPoints.length > 0) {
@@ -778,7 +830,11 @@ class GeometryEngine {
     if (filletGeometries.length === 0) return geometry.clone();
 
     const mergedGeometries = [geometry, ...filletGeometries];
-    return this._mergeGeometries(mergedGeometries);
+    const result = this._mergeGeometries(mergedGeometries);
+    for (const fg of filletGeometries) {
+      fg.dispose();
+    }
+    return result;
   }
 
   /**
@@ -789,8 +845,13 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   applyChamfer(geometry, edgeIndices, distance) {
+    if (!geometry) return new THREE.BufferGeometry();
+    if (typeof distance !== 'number' || isNaN(distance) || distance <= 0) return geometry.clone();
+
     const edges = this._extractEdges(geometry);
     const posAttr = geometry.getAttribute('position');
+    if (!posAttr || posAttr.count === 0) return geometry.clone();
+
     const vertices = [];
     for (let i = 0; i < posAttr.count; i++) {
       vertices.push(new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)));
@@ -835,18 +896,29 @@ class GeometryEngine {
       const n1 = this._computeTriangleNormal(triangles[adjacentTris[0]], vertices);
       const n2 = this._computeTriangleNormal(triangles[adjacentTris[1]], vertices);
 
-      if (n1.dot(n2) > 0.999) continue;
+      const dot = Math.max(-1, Math.min(1, n1.dot(n2)));
+      if (dot > 0.95 || dot < -0.95) continue;
 
       const edgeStart = vertices[edge[0]].clone();
       const edgeEnd = vertices[edge[1]].clone();
+      const edgeLength = edgeStart.distanceTo(edgeEnd);
+      if (edgeLength < 1e-4) continue;
+
+      const maxSafeDist = edgeLength * 0.45;
+      const safeDistance = Math.min(distance, maxSafeDist);
+      if (safeDistance < 1e-4) continue;
 
       // Create chamfer (single flat face between the two beveled positions)
-      const chamferGeom = this._buildChamferStrip(edgeStart, edgeEnd, n1, n2, distance);
+      const chamferGeom = this._buildChamferStrip(edgeStart, edgeEnd, n1, n2, safeDistance);
       if (chamferGeom) chamferGeometries.push(chamferGeom);
     }
 
     if (chamferGeometries.length === 0) return geometry.clone();
-    return this._mergeGeometries([geometry, ...chamferGeometries]);
+    const result = this._mergeGeometries([geometry, ...chamferGeometries]);
+    for (const cg of chamferGeometries) {
+      cg.dispose();
+    }
+    return result;
   }
 
   /**
@@ -857,6 +929,19 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   applyShell(geometry, thickness, excludeFaces = []) {
+    if (!geometry) return new THREE.BufferGeometry();
+    if (typeof thickness !== 'number' || isNaN(thickness) || thickness <= 0) return geometry.clone();
+
+    // Guard against self-intersecting inner offset walls by clamping against solid dimensions
+    geometry.computeBoundingBox();
+    const bbox = geometry.boundingBox || new THREE.Box3();
+    const size = new THREE.Vector3();
+    bbox.getSize(size);
+    const minDim = Math.min(size.x, size.y, size.z);
+    const maxSafeThickness = minDim > 0 ? minDim * 0.45 : 10;
+    const safeThickness = Math.min(thickness, maxSafeThickness);
+    if (safeThickness < 1e-4) return geometry.clone();
+
     geometry.computeVertexNormals();
 
     const posAttr = geometry.getAttribute('position');
@@ -881,9 +966,9 @@ class GeometryEngine {
       const ny = normAttr.getY(i);
       const nz = normAttr.getZ(i);
       innerPositions.push(
-        posAttr.getX(i) - nx * thickness,
-        posAttr.getY(i) - ny * thickness,
-        posAttr.getZ(i) - nz * thickness
+        posAttr.getX(i) - nx * safeThickness,
+        posAttr.getY(i) - ny * safeThickness,
+        posAttr.getZ(i) - nz * safeThickness
       );
       // Flip normals for inner shell
       innerNormals.push(-nx, -ny, -nz);
@@ -970,7 +1055,7 @@ class GeometryEngine {
     } = options;
 
     const radius = diameter / 2;
-    const dir = direction.clone().normalize();
+    const dir = safeNormalize(direction, new THREE.Vector3(0, 0, 1));
 
     // Create the hole cylinder tool
     let holeGeometry;
@@ -981,31 +1066,29 @@ class GeometryEngine {
         break;
       }
       case 'blind': {
-        // Cylinder with a flat or conical bottom
         const cylinderGeom = new THREE.CylinderGeometry(radius, radius, depth, segments);
-        // Add a cone tip at the bottom (118° drill point typical)
         const tipHeight = radius * Math.tan((Math.PI - (118 * Math.PI / 180)) / 2);
         const coneGeom = new THREE.ConeGeometry(radius, tipHeight, segments);
         coneGeom.translate(0, -(depth / 2 + tipHeight / 2), 0);
 
         holeGeometry = this._mergeGeometries([cylinderGeom, coneGeom]);
+        cylinderGeom.dispose();
+        coneGeom.dispose();
         break;
       }
       case 'counterbore': {
-        // Main hole cylinder
         const mainCylinder = new THREE.CylinderGeometry(radius, radius, depth || 1000, segments);
-        // Counterbore cylinder (wider, shallower)
         const cbRadius = cbDiameter / 2;
         const cbCylinder = new THREE.CylinderGeometry(cbRadius, cbRadius, cbDepth, segments);
         cbCylinder.translate(0, (depth || 500) / 2 - cbDepth / 2, 0);
 
         holeGeometry = this._mergeGeometries([mainCylinder, cbCylinder]);
+        mainCylinder.dispose();
+        cbCylinder.dispose();
         break;
       }
       case 'countersink': {
-        // Main hole cylinder
         const mainCyl = new THREE.CylinderGeometry(radius, radius, depth || 1000, segments);
-        // Countersink cone
         const csAngleRad = csAngle * Math.PI / 180;
         const csRadius = radius * 1.6;
         const csHeight = (csRadius - radius) / Math.tan(csAngleRad / 2);
@@ -1013,30 +1096,26 @@ class GeometryEngine {
         csCone.translate(0, (depth || 500) / 2 - csHeight / 2, 0);
 
         holeGeometry = this._mergeGeometries([mainCyl, csCone]);
+        mainCyl.dispose();
+        csCone.dispose();
         break;
       }
       default:
         holeGeometry = new THREE.CylinderGeometry(radius, radius, depth || 1000, segments);
     }
 
-    // Orient the hole: default CylinderGeometry is along Y
-    // Rotate so the cylinder axis aligns with the hole direction
     const defaultAxis = new THREE.Vector3(0, 1, 0);
     if (dir.distanceTo(defaultAxis) > EPSILON) {
       const quaternion = new THREE.Quaternion().setFromUnitVectors(defaultAxis, dir);
       holeGeometry.applyQuaternion(quaternion);
     }
 
-    // Translate to position
     holeGeometry.translate(position.x, position.y, position.z);
 
-    // Boolean subtract the hole from the body
-    return this.booleanSubtract(geometry, holeGeometry);
+    const result = this.booleanSubtract(geometry, holeGeometry);
+    holeGeometry.dispose();
+    return result;
   }
-
-  // ==========================================================================
-  // Pattern Operations
-  // ==========================================================================
 
   /**
    * Create a linear pattern of geometry.
@@ -1047,17 +1126,23 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   linearPattern(geometry, direction, count, spacing) {
-    const dir = direction.clone().normalize();
+    const dir = safeNormalize(direction, new THREE.Vector3(1, 0, 0));
     const geometries = [geometry];
+    const clonesToDispose = [];
 
     for (let i = 1; i < count; i++) {
       const clone = geometry.clone();
       const offset = dir.clone().multiplyScalar(spacing * i);
       clone.translate(offset.x, offset.y, offset.z);
       geometries.push(clone);
+      clonesToDispose.push(clone);
     }
 
-    return this._mergeGeometries(geometries);
+    const result = this._mergeGeometries(geometries);
+    for (const c of clonesToDispose) {
+      c.dispose();
+    }
+    return result;
   }
 
   /**
@@ -1069,18 +1154,24 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   circularPattern(geometry, axis, count, angle = Math.PI * 2) {
-    const normalizedAxis = axis.clone().normalize();
+    const normalizedAxis = safeNormalize(axis, new THREE.Vector3(0, 1, 0));
     const geometries = [geometry];
-    const angleStep = angle / count;
+    const clonesToDispose = [];
+    const angleStep = angle / Math.max(1, count);
 
     for (let i = 1; i < count; i++) {
       const clone = geometry.clone();
       const rotationMatrix = new THREE.Matrix4().makeRotationAxis(normalizedAxis, angleStep * i);
       clone.applyMatrix4(rotationMatrix);
       geometries.push(clone);
+      clonesToDispose.push(clone);
     }
 
-    return this._mergeGeometries(geometries);
+    const result = this._mergeGeometries(geometries);
+    for (const c of clonesToDispose) {
+      c.dispose();
+    }
+    return result;
   }
 
   /**
@@ -1107,7 +1198,6 @@ class GeometryEngine {
           mirrorMatrix.makeScale(-1, 1, 1);
       }
     } else {
-      // Custom plane: reflect across the plane's normal
       const n = plane.normal;
       mirrorMatrix.set(
         1 - 2 * n.x * n.x, -2 * n.x * n.y, -2 * n.x * n.z, -2 * n.x * plane.constant,
@@ -1120,7 +1210,6 @@ class GeometryEngine {
     const mirrored = geometry.clone();
     mirrored.applyMatrix4(mirrorMatrix);
 
-    // Fix winding order (mirror flips normals)
     const indexAttr = mirrored.index;
     if (indexAttr) {
       const indices = Array.from(indexAttr.array);
@@ -1131,10 +1220,8 @@ class GeometryEngine {
       }
       mirrored.setIndex(indices);
     } else {
-      // Reverse face winding in non-indexed geometry
       const posAttr = mirrored.getAttribute('position');
       for (let i = 0; i < posAttr.count; i += 3) {
-        // Swap vertex 1 and 2 of each triangle
         const x1 = posAttr.getX(i + 1), y1 = posAttr.getY(i + 1), z1 = posAttr.getZ(i + 1);
         const x2 = posAttr.getX(i + 2), y2 = posAttr.getY(i + 2), z2 = posAttr.getZ(i + 2);
         posAttr.setXYZ(i + 1, x2, y2, z2);
@@ -1144,8 +1231,9 @@ class GeometryEngine {
 
     mirrored.computeVertexNormals();
 
-    // Merge original and mirrored
-    return this._mergeGeometries([geometry, mirrored]);
+    const result = this._mergeGeometries([geometry, mirrored]);
+    mirrored.dispose();
+    return result;
   }
 
   // ==========================================================================
@@ -1162,8 +1250,14 @@ class GeometryEngine {
     if (!geomA) return geomB ? geomB.clone() : null;
     if (!geomB) return geomA ? geomA.clone() : null;
 
-    const a = new CSGNode(geometryToPolygons(geomA.clone()));
-    const b = new CSGNode(geometryToPolygons(geomB.clone()));
+    geomA.computeBoundingBox();
+    geomB.computeBoundingBox();
+    if (geomA.boundingBox && geomB.boundingBox && !geomA.boundingBox.intersectsBox(geomB.boundingBox)) {
+      return this._mergeGeometries([geomA, geomB]);
+    }
+
+    const a = new CSGNode(geometryToPolygons(geomA));
+    const b = new CSGNode(geometryToPolygons(geomB));
 
     a.clipTo(b);
     b.clipTo(a);
@@ -1188,8 +1282,14 @@ class GeometryEngine {
     if (!geomA) return null;
     if (!geomB) return geomA.clone();
 
-    const a = new CSGNode(geometryToPolygons(geomA.clone()));
-    const b = new CSGNode(geometryToPolygons(geomB.clone()));
+    geomA.computeBoundingBox();
+    geomB.computeBoundingBox();
+    if (geomA.boundingBox && geomB.boundingBox && !geomA.boundingBox.intersectsBox(geomB.boundingBox)) {
+      return geomA.clone();
+    }
+
+    const a = new CSGNode(geometryToPolygons(geomA));
+    const b = new CSGNode(geometryToPolygons(geomB));
 
     a.invert();
     a.clipTo(b);
@@ -1213,12 +1313,24 @@ class GeometryEngine {
    * @returns {THREE.BufferGeometry}
    */
   booleanIntersect(geomA, geomB) {
-    const a = new CSGNode(geometryToPolygons(geomA.clone()));
-    const b = new CSGNode(geometryToPolygons(geomB.clone()));
+    if (!geomA || !geomB) return new THREE.BufferGeometry();
+
+    geomA.computeBoundingBox();
+    geomB.computeBoundingBox();
+    if (geomA.boundingBox && geomB.boundingBox && !geomA.boundingBox.intersectsBox(geomB.boundingBox)) {
+      return new THREE.BufferGeometry();
+    }
+
+    const a = new CSGNode(geometryToPolygons(geomA));
+    const b = new CSGNode(geometryToPolygons(geomB));
+
+    const aInverted = a.clone();
+    aInverted.invert();
+
+    b.clipTo(aInverted);
+    b.invert();
 
     a.invert();
-    b.clipTo(a);
-    b.invert();
     a.clipTo(b);
     b.clipTo(a);
     a.build(b.allPolygons());
@@ -1319,34 +1431,45 @@ class GeometryEngine {
     }
 
     volume = Math.abs(volume);
+    if (!isFinite(volume) || isNaN(volume)) volume = 0;
+    if (!isFinite(surfaceArea) || isNaN(surfaceArea)) surfaceArea = 0;
 
     if (volume > EPSILON) {
       centerOfMass.divideScalar(volume);
     }
+    if (!isFinite(centerOfMass.x) || isNaN(centerOfMass.x)) centerOfMass.x = 0;
+    if (!isFinite(centerOfMass.y) || isNaN(centerOfMass.y)) centerOfMass.y = 0;
+    if (!isFinite(centerOfMass.z) || isNaN(centerOfMass.z)) centerOfMass.z = 0;
 
     const density = material.density || 7900; // kg/m³
     const mass = volume * density;
 
     // Convert moment of inertia to actual values with density
     const momentOfInertia = {
-      Ixx: Math.abs(Ixx) * density,
-      Iyy: Math.abs(Iyy) * density,
-      Izz: Math.abs(Izz) * density,
-      Ixy: Ixy * density,
-      Ixz: Ixz * density,
-      Iyz: Iyz * density,
+      Ixx: isFinite(Ixx) ? Math.abs(Ixx) * density : 0,
+      Iyy: isFinite(Iyy) ? Math.abs(Iyy) * density : 0,
+      Izz: isFinite(Izz) ? Math.abs(Izz) * density : 0,
+      Ixy: isFinite(Ixy) ? Ixy * density : 0,
+      Ixz: isFinite(Ixz) ? Ixz * density : 0,
+      Iyz: isFinite(Iyz) ? Iyz * density : 0,
     };
 
     // Bounding box
     geometry.computeBoundingBox();
-    const bbox = geometry.boundingBox;
+    const bbox = geometry.boundingBox || new THREE.Box3();
+    const minX = isFinite(bbox.min.x) ? bbox.min.x : 0;
+    const minY = isFinite(bbox.min.y) ? bbox.min.y : 0;
+    const minZ = isFinite(bbox.min.z) ? bbox.min.z : 0;
+    const maxX = isFinite(bbox.max.x) ? bbox.max.x : 0;
+    const maxY = isFinite(bbox.max.y) ? bbox.max.y : 0;
+    const maxZ = isFinite(bbox.max.z) ? bbox.max.z : 0;
     const boundingBox = {
-      min: { x: bbox.min.x, y: bbox.min.y, z: bbox.min.z },
-      max: { x: bbox.max.x, y: bbox.max.y, z: bbox.max.z },
+      min: { x: minX, y: minY, z: minZ },
+      max: { x: maxX, y: maxY, z: maxZ },
       size: {
-        x: bbox.max.x - bbox.min.x,
-        y: bbox.max.y - bbox.min.y,
-        z: bbox.max.z - bbox.min.z,
+        x: maxX - minX,
+        y: maxY - minY,
+        z: maxZ - minZ,
       },
     };
 
@@ -1601,22 +1724,30 @@ class GeometryEngine {
     const c = vertices[tri[2]];
     const ab = new THREE.Vector3().subVectors(b, a);
     const ac = new THREE.Vector3().subVectors(c, a);
-    return new THREE.Vector3().crossVectors(ab, ac).normalize();
+    return safeNormalize(new THREE.Vector3().crossVectors(ab, ac), new THREE.Vector3(0, 0, 1));
   }
 
   /** Compute fillet arc points between two face normals */
   _computeFilletArc(edgeStart, edgeEnd, n1, n2, radius, segments) {
     const arcPoints = [];
-    const edgeDir = new THREE.Vector3().subVectors(edgeEnd, edgeStart).normalize();
+    const edgeDir = safeNormalize(new THREE.Vector3().subVectors(edgeEnd, edgeStart), new THREE.Vector3(0, 0, 1));
 
     // Bisector between the two normals
-    const bisector = new THREE.Vector3().addVectors(n1, n2).normalize();
+    const bisector = safeNormalize(new THREE.Vector3().addVectors(n1, n2), new THREE.Vector3(0, 1, 0));
 
     // Angle between normals
-    const angle = Math.acos(Math.max(-1, Math.min(1, n1.dot(n2))));
+    const dot = Math.max(-1, Math.min(1, n1.dot(n2)));
+    if (dot > 0.999 || dot < -0.999) {
+      return [];
+    }
+    const angle = Math.acos(dot);
+    const sinHalf = Math.sin(angle / 2);
+    if (sinHalf < 1e-4) {
+      return [];
+    }
 
     // Center of the fillet arc (offset from edge along bisector)
-    const offsetDist = radius / Math.sin(angle / 2);
+    const offsetDist = radius / sinHalf;
 
     for (let i = 0; i <= segments; i++) {
       const t = i / segments;
@@ -1635,8 +1766,9 @@ class GeometryEngine {
 
   /** Build a fillet strip geometry along an edge */
   _buildFilletStrip(edgeStart, edgeEnd, arcPoints, segments) {
+    if (!arcPoints || arcPoints.length === 0) return new THREE.BufferGeometry();
     const positions = [];
-    const edgeDir = new THREE.Vector3().subVectors(edgeEnd, edgeStart).normalize();
+    const edgeDir = safeNormalize(new THREE.Vector3().subVectors(edgeEnd, edgeStart), new THREE.Vector3(0, 0, 1));
     const edgeLength = edgeStart.distanceTo(edgeEnd);
 
     // Sample points along the edge
@@ -1676,7 +1808,7 @@ class GeometryEngine {
   /** Build a chamfer strip (single flat face) along an edge */
   _buildChamferStrip(edgeStart, edgeEnd, n1, n2, distance) {
     const positions = [];
-    const edgeDir = new THREE.Vector3().subVectors(edgeEnd, edgeStart).normalize();
+    const edgeDir = safeNormalize(new THREE.Vector3().subVectors(edgeEnd, edgeStart), new THREE.Vector3(0, 0, 1));
     const edgeLength = edgeStart.distanceTo(edgeEnd);
     const edgeSteps = Math.max(2, Math.ceil(edgeLength / 5));
 
@@ -1750,21 +1882,28 @@ class GeometryEngine {
     let vertexOffset = 0;
 
     for (const geom of geometries) {
+      if (!geom) continue;
       // Ensure the geometry is non-indexed or handle both
-      const nonIndexed = geom.index ? geom.toNonIndexed() : geom;
+      const isIndexed = !!geom.index;
+      const nonIndexed = isIndexed ? geom.toNonIndexed() : geom;
       nonIndexed.computeVertexNormals();
 
       const posAttr = nonIndexed.getAttribute('position');
       const normAttr = nonIndexed.getAttribute('normal');
 
-      for (let i = 0; i < posAttr.count; i++) {
-        positions.push(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-        if (normAttr) {
-          normals.push(normAttr.getX(i), normAttr.getY(i), normAttr.getZ(i));
+      if (posAttr) {
+        for (let i = 0; i < posAttr.count; i++) {
+          positions.push(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+          if (normAttr) {
+            normals.push(normAttr.getX(i), normAttr.getY(i), normAttr.getZ(i));
+          }
         }
+        vertexOffset += posAttr.count;
       }
 
-      vertexOffset += posAttr.count;
+      if (isIndexed && nonIndexed !== geom && typeof nonIndexed.dispose === 'function') {
+        nonIndexed.dispose();
+      }
     }
 
     const merged = new THREE.BufferGeometry();

@@ -95,6 +95,9 @@ const NumericInput = ({
 
   /** Handle keyboard events */
   const handleKeyDown = useCallback((e) => {
+    // Stop typing/arrow keys from propagating to global shortcuts (L, R, C, D, Space, etc.)
+    e.stopPropagation();
+
     if (e.key === 'Enter') {
       commitValue();
       inputRef.current?.blur();

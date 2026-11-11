@@ -22,6 +22,9 @@ import {
   SphereSurface,
   SURFACE_TYPES,
   CURVE_TYPES,
+  safeNormalize,
+  sanitizePoint,
+  removeConsecutiveDuplicates,
 } from './Topology.js';
 import { generateId, EPSILON } from '../utils/math.js';
 
@@ -31,8 +34,8 @@ import { generateId, EPSILON } from '../utils/math.js';
 
 class BRepCSGVertex {
   constructor(pos, normal) {
-    this.pos = pos.clone();
-    this.normal = normal ? normal.clone() : new THREE.Vector3(0, 0, 1);
+    this.pos = sanitizePoint(pos);
+    this.normal = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
   }
   clone() {
     return new BRepCSGVertex(this.pos, this.normal);
@@ -41,23 +44,42 @@ class BRepCSGVertex {
     this.normal.negate();
   }
   interpolate(other, t) {
-    return new BRepCSGVertex(
-      this.pos.clone().lerp(other.pos, t),
-      this.normal.clone().lerp(other.normal, t).normalize()
-    );
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+    const p = this.pos.clone().lerp(other.pos, clampedT);
+    const n = this.normal.clone().lerp(other.normal, clampedT);
+    return new BRepCSGVertex(p, safeNormalize(n, this.normal));
   }
 }
 
 class BRepCSGPlane {
   constructor(normal, w) {
-    this.normal = normal.clone().normalize();
-    this.w = w;
+    this.normal = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
+    this.w = typeof w === 'number' && !isNaN(w) && isFinite(w) ? w : 0;
   }
   static fromPoints(a, b, c) {
     const ab = new THREE.Vector3().subVectors(b, a);
     const ac = new THREE.Vector3().subVectors(c, a);
-    const n = new THREE.Vector3().crossVectors(ab, ac).normalize();
-    return new BRepCSGPlane(n, n.dot(a));
+    const n = new THREE.Vector3().crossVectors(ab, ac);
+    const norm = safeNormalize(n, new THREE.Vector3(0, 0, 1));
+    return new BRepCSGPlane(norm, norm.dot(a));
+  }
+  static fromVertices(vertices) {
+    if (!vertices || vertices.length < 3) {
+      return new BRepCSGPlane(new THREE.Vector3(0, 0, 1), 0);
+    }
+    const normal = new THREE.Vector3(0, 0, 0);
+    const center = new THREE.Vector3(0, 0, 0);
+    for (let i = 0; i < vertices.length; i++) {
+      const curr = vertices[i].pos;
+      const next = vertices[(i + 1) % vertices.length].pos;
+      normal.x += (curr.y - next.y) * (curr.z + next.z);
+      normal.y += (curr.z - next.z) * (curr.x + next.x);
+      normal.z += (curr.x - next.x) * (curr.y + next.y);
+      center.add(curr);
+    }
+    center.divideScalar(vertices.length);
+    const norm = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
+    return new BRepCSGPlane(norm, norm.dot(center));
   }
   clone() {
     return new BRepCSGPlane(this.normal, this.w);
@@ -71,7 +93,7 @@ class BRepCSGPlane {
     const FRONT = 1;
     const BACK = 2;
     const SPANNING = 3;
-    const TOL = 1e-5;
+    const TOL = 1e-4;
 
     let polygonType = 0;
     const types = [];
@@ -110,14 +132,20 @@ class BRepCSGPlane {
             const dir = new THREE.Vector3().subVectors(vj.pos, vi.pos);
             const denom = this.normal.dot(dir);
             const t = Math.abs(denom) > 1e-9 ? (this.w - this.normal.dot(vi.pos)) / denom : 0;
-            const clampedT = Math.max(0, Math.min(1, t));
+            const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
             const v = vi.interpolate(vj, clampedT);
             f.push(v);
             b.push(v.clone());
           }
         }
-        if (f.length >= 3) front.push(new BRepCSGPolygon(f, polygon.shared));
-        if (b.length >= 3) back.push(new BRepCSGPolygon(b, polygon.shared));
+        if (f.length >= 3) {
+          const polyF = new BRepCSGPolygon(f, polygon.shared);
+          if (polyF.computeArea() > 1e-9) front.push(polyF);
+        }
+        if (b.length >= 3) {
+          const polyB = new BRepCSGPolygon(b, polygon.shared);
+          if (polyB.computeArea() > 1e-9) back.push(polyB);
+        }
         break;
       }
     }
@@ -126,9 +154,30 @@ class BRepCSGPlane {
 
 class BRepCSGPolygon {
   constructor(vertices, shared = null) {
-    this.vertices = vertices;
+    const cleaned = [];
+    for (let i = 0; i < vertices.length; i++) {
+      const v = vertices[i];
+      if (!cleaned.length || v.pos.distanceTo(cleaned[cleaned.length - 1].pos) > 1e-6) {
+        cleaned.push(v);
+      }
+    }
+    if (cleaned.length > 1 && cleaned[0].pos.distanceTo(cleaned[cleaned.length - 1].pos) <= 1e-6) {
+      cleaned.pop();
+    }
+    this.vertices = cleaned.length >= 3 ? cleaned : vertices;
     this.shared = shared;
-    this.plane = BRepCSGPlane.fromPoints(vertices[0].pos, vertices[1].pos, vertices[2].pos);
+    this.plane = BRepCSGPlane.fromVertices(this.vertices);
+  }
+  computeArea() {
+    if (this.vertices.length < 3) return 0;
+    let areaVec = new THREE.Vector3(0, 0, 0);
+    for (let i = 0; i < this.vertices.length; i++) {
+      const v0 = this.vertices[i].pos;
+      const v1 = this.vertices[(i + 1) % this.vertices.length].pos;
+      areaVec.add(new THREE.Vector3().crossVectors(v0, v1));
+    }
+    const a = areaVec.dot(this.plane.normal) * 0.5;
+    return isNaN(a) ? 0 : Math.abs(a);
   }
   clone() {
     return new BRepCSGPolygon(this.vertices.map(v => v.clone()), this.shared);
@@ -192,7 +241,7 @@ class BRepCSGNode {
     return polygons;
   }
   build(polygons) {
-    if (polygons.length === 0) return;
+    if (!polygons || polygons.length === 0) return;
     if (!this.plane) {
       this.plane = polygons[0].plane.clone();
     }
@@ -747,10 +796,10 @@ export function sweepSolid(profileOrShape, pathOrPoints, options = {}) {
 
   // Compute rotation-minimizing frames (RMF) along path to eliminate twist
   const frames = [];
-  let prevTangent = new THREE.Vector3().subVectors(pathPts[1], pathPts[0]).normalize();
+  let prevTangent = safeNormalize(new THREE.Vector3().subVectors(pathPts[1], pathPts[0]), new THREE.Vector3(0, 0, 1));
   let prevNormal = Math.abs(prevTangent.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-  let prevBinormal = new THREE.Vector3().crossVectors(prevTangent, prevNormal).normalize();
-  prevNormal = new THREE.Vector3().crossVectors(prevBinormal, prevTangent).normalize();
+  let prevBinormal = safeNormalize(new THREE.Vector3().crossVectors(prevTangent, prevNormal), new THREE.Vector3(0, 1, 0));
+  prevNormal = safeNormalize(new THREE.Vector3().crossVectors(prevBinormal, prevTangent), new THREE.Vector3(1, 0, 0));
 
   frames.push({ pos: pathPts[0], tangent: prevTangent, normal: prevNormal, binormal: prevBinormal });
 
@@ -759,22 +808,26 @@ export function sweepSolid(profileOrShape, pathOrPoints, options = {}) {
     const prevPos = pathPts[i - 1];
     let tangent;
     if (i < nSteps - 1) {
-      tangent = new THREE.Vector3().subVectors(pathPts[i + 1], prevPos).normalize();
+      tangent = safeNormalize(new THREE.Vector3().subVectors(pathPts[i + 1], prevPos), prevTangent);
     } else {
-      tangent = new THREE.Vector3().subVectors(curPos, prevPos).normalize();
+      tangent = safeNormalize(new THREE.Vector3().subVectors(curPos, prevPos), prevTangent);
     }
 
     // Double-reflection method for RMF
     const v1 = new THREE.Vector3().subVectors(curPos, prevPos);
     const c1 = v1.dot(v1);
-    const rLNormal = prevNormal.clone().addScaledVector(v1, -(2 / c1) * v1.dot(prevNormal));
-    const rLTangent = prevTangent.clone().addScaledVector(v1, -(2 / c1) * v1.dot(prevTangent));
+    let rLNormal = prevNormal.clone();
+    let rLTangent = prevTangent.clone();
+    if (c1 > 1e-12) {
+      rLNormal.addScaledVector(v1, -(2 / c1) * v1.dot(prevNormal));
+      rLTangent.addScaledVector(v1, -(2 / c1) * v1.dot(prevTangent));
+    }
 
     const v2 = new THREE.Vector3().subVectors(tangent, rLTangent);
     const c2 = v2.dot(v2);
-    let curNormal = Math.abs(c2) > 1e-9 ? rLNormal.clone().addScaledVector(v2, -(2 / c2) * v2.dot(rLNormal)) : rLNormal;
-    curNormal.normalize();
-    const curBinormal = new THREE.Vector3().crossVectors(tangent, curNormal).normalize();
+    let curNormal = c2 > 1e-12 ? rLNormal.clone().addScaledVector(v2, -(2 / c2) * v2.dot(rLNormal)) : rLNormal;
+    curNormal = safeNormalize(curNormal, prevNormal);
+    const curBinormal = safeNormalize(new THREE.Vector3().crossVectors(tangent, curNormal), prevBinormal);
 
     frames.push({ pos: curPos, tangent, normal: curNormal, binormal: curBinormal });
     prevTangent = tangent;
@@ -975,6 +1028,9 @@ export function loftSolid(profilesOrShapes = [], options = {}) {
  * Rounds target sharp edges with cylindrical blend faces, trimming adjacent loops
  */
 export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, options = {}) {
+  if (!solidBody || !solidBody.outerShell) return solidBody;
+  if (typeof radius !== 'number' || isNaN(radius) || radius <= 0) return solidBody;
+
   const { segments = 4 } = options;
   const geom = solidToBufferGeometry(solidBody);
 
@@ -982,6 +1038,11 @@ export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, optio
   const posAttr = geom.getAttribute('position');
   const normAttr = geom.getAttribute('normal');
   const indexAttr = geom.index;
+
+  if (!posAttr || posAttr.count === 0) {
+    geom.dispose();
+    return solidBody;
+  }
 
   // Build edge adjacency and normals
   const edges = [];
@@ -1002,7 +1063,11 @@ export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, optio
   for (let t = 0; t < triCount; t++) {
     const [i0, i1, i2] = getTri(t);
     const p0 = getPt(i0), p1 = getPt(i1), p2 = getPt(i2);
-    const fn = new THREE.Vector3().crossVectors(new THREE.Vector3().subVectors(p1, p0), new THREE.Vector3().subVectors(p2, p0)).normalize();
+    const e1 = new THREE.Vector3().subVectors(p1, p0);
+    const e2 = new THREE.Vector3().subVectors(p2, p0);
+    const fnCross = new THREE.Vector3().crossVectors(e1, e2);
+    if (fnCross.lengthSq() < 1e-12) continue; // Degenerate triangle
+    const fn = fnCross.normalize();
 
     const triEdges = [[p0, p1], [p1, p2], [p2, p0]];
     for (const [pa, pb] of triEdges) {
@@ -1025,15 +1090,23 @@ export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, optio
     if (isTarget && e.normals.length === 2) {
       const n1 = e.normals[0];
       const n2 = e.normals[1];
-      const dot = n1.dot(n2);
+      const dot = Math.max(-1, Math.min(1, n1.dot(n2)));
 
-      // Sharp edge if normals differ
+      // Sharp edge if normals differ (guard colinear / flat edges)
       if (dot < 0.95 && dot > -0.95) {
-        const edgeDir = new THREE.Vector3().subVectors(e.b, e.a).normalize();
-        const b1 = new THREE.Vector3().crossVectors(n1, edgeDir).normalize();
-        const b2 = new THREE.Vector3().crossVectors(edgeDir, n2).normalize();
+        const edgeLength = e.a.distanceTo(e.b);
+        if (edgeLength < 1e-4) continue;
 
-        const offsetDist = Math.min(radius, e.a.distanceTo(e.b) * 0.3);
+        // Ensure radius doesn't exceed adjacent edge lengths
+        const maxSafeDist = edgeLength * 0.45;
+        const safeRadius = Math.min(radius, maxSafeDist);
+        if (safeRadius < 1e-4) continue;
+
+        const edgeDir = safeNormalize(new THREE.Vector3().subVectors(e.b, e.a), new THREE.Vector3(0, 0, 1));
+        const b1 = safeNormalize(new THREE.Vector3().crossVectors(n1, edgeDir), new THREE.Vector3(1, 0, 0));
+        const b2 = safeNormalize(new THREE.Vector3().crossVectors(edgeDir, n2), new THREE.Vector3(0, 1, 0));
+
+        const offsetDist = safeRadius;
 
         const a1 = e.a.clone().addScaledVector(b1, -offsetDist);
         const b1End = e.b.clone().addScaledVector(b1, -offsetDist);
@@ -1045,10 +1118,15 @@ export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, optio
         const vB2 = new BRepCSGVertex(b2End, n2);
         const vA2 = new BRepCSGVertex(a2, n2);
 
-        filletPolygons.push(new BRepCSGPolygon([vA1, vB1, vB2, vA2]));
+        const poly = new BRepCSGPolygon([vA1, vB1, vB2, vA2]);
+        if (poly.computeArea() > 1e-9) {
+          filletPolygons.push(poly);
+        }
       }
     }
   }
+
+  geom.dispose();
 
   if (filletPolygons.length === 0) {
     return solidBody;
@@ -1057,7 +1135,7 @@ export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, optio
   // Merge fillet polygons with original geometry
   const origPolys = solidToPolygons(solidBody);
   const combined = origPolys.concat(filletPolygons);
-  return polygonsToSolid(combined);
+  return polygonsToSolid(combined, solidBody.name + '_Filleted');
 }
 
 /**
@@ -1065,6 +1143,8 @@ export function filletSolid(solidBody, targetEdgeIndices = [], radius = 2, optio
  * Bevels target sharp edges with planar chamfer faces
  */
 export function chamferSolid(solidBody, targetEdgeIndices = [], distance = 2, options = {}) {
+  if (!solidBody || !solidBody.outerShell) return solidBody;
+  if (typeof distance !== 'number' || isNaN(distance) || distance <= 0) return solidBody;
   return filletSolid(solidBody, targetEdgeIndices, distance, options);
 }
 
@@ -1073,7 +1153,17 @@ export function chamferSolid(solidBody, targetEdgeIndices = [], distance = 2, op
  * Creates uniform hollow interior with wall thickness offset
  */
 export function shellSolid(solidBody, thickness = 2, excludeFaceIds = [], options = {}) {
-  if (thickness <= 0) return solidBody;
+  if (!solidBody || !solidBody.outerShell) return solidBody;
+  if (typeof thickness !== 'number' || isNaN(thickness) || thickness <= 0) return solidBody;
+
+  // Guard against self-intersecting inner walls by clamping against solid dimensions
+  const bbox = solidBody.computeBoundingBox();
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+  const minDim = Math.min(size.x, size.y, size.z);
+  const maxSafeThickness = minDim > 0 ? minDim * 0.45 : 10;
+  const safeThickness = Math.min(thickness, maxSafeThickness);
+  if (safeThickness < 1e-4) return solidBody;
 
   // Case 1: Closed tank/cavity (no excluded faces)
   // Duplicates outer shell and creates an internal void shell with reversed normals
@@ -1081,24 +1171,43 @@ export function shellSolid(solidBody, thickness = 2, excludeFaceIds = [], option
     const outerShell = solidBody.outerShell;
     if (!outerShell) return solidBody;
 
+    // Calculate vertex normal for each vertex of the outer shell by averaging incident face normals
+    const vertMap = new Map();
+    for (const face of outerShell.faces) {
+      for (const v of face.getVertices()) {
+        if (!vertMap.has(v.id)) {
+          vertMap.set(v.id, { vert: v, normals: [] });
+        }
+        vertMap.get(v.id).normals.push(face.normal);
+      }
+    }
+
+    const innerVertMap = new Map();
+    for (const [vid, info] of vertMap.entries()) {
+      const avgNorm = new THREE.Vector3(0, 0, 0);
+      for (const n of info.normals) avgNorm.add(n);
+      const vNorm = safeNormalize(avgNorm, new THREE.Vector3(0, 0, 1));
+      const innerPt = info.vert.point.clone().addScaledVector(vNorm, -safeThickness);
+      innerVertMap.set(vid, new Vertex(innerPt));
+    }
+
     const voidFaces = [];
     for (const face of outerShell.faces) {
       const invNorm = face.normal.clone().negate();
-      const shift = invNorm.clone().multiplyScalar(thickness);
 
       const shiftedOuterCoedges = [];
       if (face.outerLoop) {
         for (let i = face.outerLoop.coedges.length - 1; i >= 0; i--) {
           const ce = face.outerLoop.coedges[i];
-          const vStart = new Vertex(ce.endVertex.point.clone().add(shift));
-          const vEnd = new Vertex(ce.startVertex.point.clone().add(shift));
+          const vStart = innerVertMap.get(ce.endVertex.id) || new Vertex(ce.endVertex.point.clone().addScaledVector(invNorm, safeThickness));
+          const vEnd = innerVertMap.get(ce.startVertex.id) || new Vertex(ce.startVertex.point.clone().addScaledVector(invNorm, safeThickness));
           const edge = new Edge(vStart, vEnd);
           shiftedOuterCoedges.push(new CoEdge(edge, true));
         }
       }
 
       const voidFace = new Face(
-        new PlaneSurface(face.surface.origin.clone().add(shift), invNorm),
+        new PlaneSurface(face.surface.origin.clone().addScaledVector(invNorm, safeThickness), invNorm),
         new Loop(shiftedOuterCoedges, true),
         [],
         false
@@ -1118,26 +1227,46 @@ export function shellSolid(solidBody, thickness = 2, excludeFaceIds = [], option
   // Keeps non-excluded faces, offsets inner shell, and bridges boundary edges with rim faces
   const origShell = solidBody.outerShell;
   const keptFaces = origShell.faces.filter(f => !excludeFaceIds.includes(f.id));
+
+  // Compute inner vertex map for kept faces
+  const vertMap = new Map();
+  for (const face of keptFaces) {
+    for (const v of face.getVertices()) {
+      if (!vertMap.has(v.id)) {
+        vertMap.set(v.id, { vert: v, normals: [] });
+      }
+      vertMap.get(v.id).normals.push(face.normal);
+    }
+  }
+
+  const innerVertMap = new Map();
+  for (const [vid, info] of vertMap.entries()) {
+    const avgNorm = new THREE.Vector3(0, 0, 0);
+    for (const n of info.normals) avgNorm.add(n);
+    const vNorm = safeNormalize(avgNorm, new THREE.Vector3(0, 0, 1));
+    const innerPt = info.vert.point.clone().addScaledVector(vNorm, -safeThickness);
+    innerVertMap.set(vid, new Vertex(innerPt));
+  }
+
   const innerFaces = [];
   const rimFaces = [];
 
   for (const face of keptFaces) {
     const inwardNorm = face.normal.clone().negate();
-    const shift = inwardNorm.clone().multiplyScalar(thickness);
 
     const innerCoedges = [];
     if (face.outerLoop) {
       for (let i = face.outerLoop.coedges.length - 1; i >= 0; i--) {
         const ce = face.outerLoop.coedges[i];
-        const vStart = new Vertex(ce.endVertex.point.clone().add(shift));
-        const vEnd = new Vertex(ce.startVertex.point.clone().add(shift));
+        const vStart = innerVertMap.get(ce.endVertex.id) || new Vertex(ce.endVertex.point.clone().addScaledVector(inwardNorm, safeThickness));
+        const vEnd = innerVertMap.get(ce.startVertex.id) || new Vertex(ce.startVertex.point.clone().addScaledVector(inwardNorm, safeThickness));
         const edge = new Edge(vStart, vEnd);
         innerCoedges.push(new CoEdge(edge, true));
       }
     }
 
     const innerFace = new Face(
-      new PlaneSurface(face.surface.origin.clone().add(shift), inwardNorm),
+      new PlaneSurface(face.surface.origin.clone().addScaledVector(inwardNorm, safeThickness), inwardNorm),
       new Loop(innerCoedges, true),
       [],
       false
@@ -1156,9 +1285,8 @@ export function shellSolid(solidBody, thickness = 2, excludeFaceIds = [], option
         const vOuterA = ce.startVertex;
         const vOuterB = ce.endVertex;
 
-        const inwardNorm = exFace.normal.clone().negate();
-        const vInnerA = new Vertex(vOuterA.point.clone().add(inwardNorm.clone().multiplyScalar(thickness)));
-        const vInnerB = new Vertex(vOuterB.point.clone().add(inwardNorm.clone().multiplyScalar(thickness)));
+        const vInnerA = innerVertMap.get(vOuterA.id) || new Vertex(vOuterA.point.clone().addScaledVector(exFace.normal, -safeThickness));
+        const vInnerB = innerVertMap.get(vOuterB.id) || new Vertex(vOuterB.point.clone().addScaledVector(exFace.normal, -safeThickness));
 
         const eOuter = new Edge(vOuterA, vOuterB);
         const eRight = new Edge(vOuterB, vInnerB);
@@ -1197,6 +1325,18 @@ export function booleanUnion(solidA, solidB) {
   if (!solidA) return solidB;
   if (!solidB) return solidA;
 
+  // Check disjoint bounding boxes
+  const boxA = solidA.computeBoundingBox();
+  const boxB = solidB.computeBoundingBox();
+  if (!boxA.intersectsBox(boxB)) {
+    // Completely disjoint bodies: combine shells directly
+    const combinedShells = [
+      ...solidA.shells.map(s => s.clone ? s.clone() : s),
+      ...solidB.shells.map(s => s.clone ? s.clone() : s),
+    ];
+    return new SolidBody(combinedShells, (solidA.name || 'SolidA') + '_Union_' + (solidB.name || 'SolidB'));
+  }
+
   const aNode = new BRepCSGNode(solidToPolygons(solidA));
   const bNode = new BRepCSGNode(solidToPolygons(solidB));
 
@@ -1218,6 +1358,14 @@ export function booleanUnion(solidA, solidB) {
 export function booleanSubtract(solidA, solidB) {
   if (!solidA) return null;
   if (!solidB) return solidA;
+
+  // Check disjoint bounding boxes
+  const boxA = solidA.computeBoundingBox();
+  const boxB = solidB.computeBoundingBox();
+  if (!boxA.intersectsBox(boxB)) {
+    // Disjoint bodies: subtraction leaves A untouched
+    return solidA;
+  }
 
   const aNode = new BRepCSGNode(solidToPolygons(solidA));
   const bNode = new BRepCSGNode(solidToPolygons(solidB));
@@ -1241,6 +1389,14 @@ export function booleanSubtract(solidA, solidB) {
  */
 export function booleanIntersect(solidA, solidB) {
   if (!solidA || !solidB) return null;
+
+  // Check disjoint bounding boxes
+  const boxA = solidA.computeBoundingBox();
+  const boxB = solidB.computeBoundingBox();
+  if (!boxA.intersectsBox(boxB)) {
+    // Disjoint bodies: intersection is empty
+    return new SolidBody([], (solidA.name || 'SolidA') + '_Intersect_' + (solidB.name || 'SolidB'));
+  }
 
   const aNode = new BRepCSGNode(solidToPolygons(solidA));
   const bNode = new BRepCSGNode(solidToPolygons(solidB));
@@ -1610,6 +1766,7 @@ function polygonsToSolid(polygons, name = 'CSGSolid') {
   geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
 
   const solid = bufferGeometryToSolid(geom);
+  geom.dispose();
   if (solid) {
     solid.name = name;
   }

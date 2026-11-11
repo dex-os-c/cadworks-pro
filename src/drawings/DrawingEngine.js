@@ -47,6 +47,20 @@ export const SHEET_SIZES = {
   ANSI_B: { width: 431.8, height: 279.4, name: 'ANSI B (17 x 11 in)' },
 };
 
+/**
+ * Robust XML string escaping for SVG export
+ * Prevents XML parsing errors from unescaped &, <, >, ", '
+ */
+export function escapeXml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 export class DrawingEngine {
   constructor() {
     this.sheet = {
@@ -76,16 +90,33 @@ export class DrawingEngine {
    * @returns {Object} { visible: LineSegment[], hidden: LineSegment[], bounds: { minX, maxX, minY, maxY } }
    */
   projectGeometry(geometry, view = PROJECTION_VIEWS.FRONT, options = {}) {
-    if (!geometry) return { visible: [], hidden: [], bounds: { minX: 0, maxX: 0, minY: 0, maxY: 0 } };
+    if (!geometry) {
+      return { visible: [], hidden: [], bounds: { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0 }, view };
+    }
+
+    const pos = geometry.getAttribute('position');
+    if (!pos || pos.count === 0) {
+      return { visible: [], hidden: [], bounds: { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0 }, view };
+    }
+
+    // Guard against zero-bounding-box models
+    geometry.computeBoundingBox();
+    const box = geometry.boundingBox || new THREE.Box3();
+    const bSize = new THREE.Vector3();
+    box.getSize(bSize);
+    if (!Number.isFinite(bSize.x) || !Number.isFinite(bSize.y) || !Number.isFinite(bSize.z) ||
+        (bSize.x <= 1e-6 && bSize.y <= 1e-6 && bSize.z <= 1e-6)) {
+      return { visible: [], hidden: [], bounds: { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0 }, view };
+    }
 
     const enableHLR = options.enableHLR !== undefined ? options.enableHLR : true;
     const creaseAngle = options.creaseAngleDeg || 25;
 
-    // 1. Extract 3D candidate feature edges (creases, boundaries, silhouettes)
-    const candidateEdges = this._extractFeatureEdges(geometry, creaseAngle);
-
-    // 2. Compute 3D Camera / Projection transformation matrix
+    // 1. Compute 3D Camera / Projection transformation matrix
     const { projMat, viewDir } = this._getProjectionMatrix(view);
+
+    // 2. Extract 3D candidate feature edges (creases, boundaries, and view-dependent silhouettes)
+    const candidateEdges = this._extractFeatureEdges(geometry, creaseAngle, projMat);
 
     // 3. Project triangles to camera coordinates for depth buffer occlusion testing
     const projectedTriangles = this._projectTriangles(geometry, projMat);
@@ -137,48 +168,150 @@ export class DrawingEngine {
       minX = maxX = minY = maxY = 0;
     }
 
+    const width = Math.max(0, maxX - minX);
+    const height = Math.max(0, maxY - minY);
+
     return {
       visible: visibleLines,
       hidden: hiddenLines,
-      bounds: { minX, maxX, minY, maxY, width: maxX - minX, height: maxY - minY },
+      bounds: { minX, maxX, minY, maxY, width, height },
       view,
     };
   }
 
   /**
-   * Extract candidate feature edges (creases with dihedral angle > creaseAngle, boundary edges)
+   * Extract candidate feature edges:
+   * - Creases with dihedral angle > creaseAngle
+   * - Boundary edges of open meshes
+   * - View-dependent silhouettes on curved surfaces (cylinders, spheres, rounded features)
    */
-  _extractFeatureEdges(geometry, creaseAngleDeg) {
+  _extractFeatureEdges(geometry, creaseAngleDeg, projMat = null) {
     const edges = [];
-    const thresholdCos = Math.cos(THREE.MathUtils.degToRad(creaseAngleDeg));
+    const edgeKeySet = new Set();
 
+    const makeEdgeKey = (p1, p2) => {
+      const k1 = `${p1.x.toFixed(2)}_${p1.y.toFixed(2)}_${p1.z.toFixed(2)}`;
+      const k2 = `${p2.x.toFixed(2)}_${p2.y.toFixed(2)}_${p2.z.toFixed(2)}`;
+      return k1 < k2 ? `${k1}#${k2}` : `${k2}#${k1}`;
+    };
+
+    // 1. Sharp dihedral crease edges
     const edgesGeom = new THREE.EdgesGeometry(geometry, creaseAngleDeg);
     const pos = edgesGeom.getAttribute('position');
 
     if (pos) {
       for (let i = 0; i < pos.count; i += 2) {
-        edges.push({
-          p1: new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)),
-          p2: new THREE.Vector3(pos.getX(i + 1), pos.getY(i + 1), pos.getZ(i + 1)),
-        });
+        const p1 = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
+        const p2 = new THREE.Vector3(pos.getX(i + 1), pos.getY(i + 1), pos.getZ(i + 1));
+        const key = makeEdgeKey(p1, p2);
+        if (!edgeKeySet.has(key)) {
+          edgeKeySet.add(key);
+          edges.push({ p1, p2 });
+        }
       }
     }
 
-    // If edges geometry was empty, fallback to wireframe or direct facet edges
+    // 2. View-dependent silhouettes for curved surfaces (cylinders, spheres, lofts)
+    if (projMat) {
+      const silhouettes = this._extractSilhouetteEdges(geometry, projMat);
+      for (const edge of silhouettes) {
+        const key = makeEdgeKey(edge.p1, edge.p2);
+        if (!edgeKeySet.has(key)) {
+          edgeKeySet.add(key);
+          edges.push(edge);
+        }
+      }
+    }
+
+    // 3. Fallback to wireframe if no edges found
     if (edges.length === 0) {
       const wire = new THREE.WireframeGeometry(geometry);
       const wPos = wire.getAttribute('position');
       if (wPos) {
         for (let i = 0; i < wPos.count; i += 2) {
-          edges.push({
-            p1: new THREE.Vector3(wPos.getX(i), wPos.getY(i), wPos.getZ(i)),
-            p2: new THREE.Vector3(wPos.getX(i + 1), wPos.getY(i + 1), wPos.getZ(i + 1)),
-          });
+          const p1 = new THREE.Vector3(wPos.getX(i), wPos.getY(i), wPos.getZ(i));
+          const p2 = new THREE.Vector3(wPos.getX(i + 1), wPos.getY(i + 1), wPos.getZ(i + 1));
+          const key = makeEdgeKey(p1, p2);
+          if (!edgeKeySet.has(key)) {
+            edgeKeySet.add(key);
+            edges.push({ p1, p2 });
+          }
         }
       }
     }
 
     return edges;
+  }
+
+  /**
+   * Extract view-dependent silhouette edges where adjacent face normals cross the horizon
+   */
+  _extractSilhouetteEdges(geometry, projMat) {
+    const pos = geometry.getAttribute('position');
+    if (!pos || pos.count === 0) return [];
+
+    const index = geometry.getIndex();
+    const numTris = index ? index.count / 3 : pos.count / 3;
+    const edgeMap = new Map();
+
+    const getVertex = (idx) => new THREE.Vector3(pos.getX(idx), pos.getY(idx), pos.getZ(idx));
+
+    for (let t = 0; t < numTris; t++) {
+      let i1, i2, i3;
+      if (index) {
+        i1 = index.getX(t * 3);
+        i2 = index.getX(t * 3 + 1);
+        i3 = index.getX(t * 3 + 2);
+      } else {
+        i1 = t * 3;
+        i2 = t * 3 + 1;
+        i3 = t * 3 + 2;
+      }
+
+      const p1 = getVertex(i1);
+      const p2 = getVertex(i2);
+      const p3 = getVertex(i3);
+
+      const p1Cam = p1.clone().applyMatrix4(projMat);
+      const p2Cam = p2.clone().applyMatrix4(projMat);
+      const p3Cam = p3.clone().applyMatrix4(projMat);
+
+      // Signed 2D area in projection indicates front vs back facing
+      const area2D = 0.5 * ((p2Cam.x - p1Cam.x) * (p3Cam.y - p1Cam.y) - (p3Cam.x - p1Cam.x) * (p2Cam.y - p1Cam.y));
+      const isFront = area2D > 1e-6;
+
+      const triEdges = [
+        [i1, i2, p1, p2],
+        [i2, i3, p2, p3],
+        [i3, i1, p3, p1],
+      ];
+
+      for (const [va, vb, ptA, ptB] of triEdges) {
+        const minIdx = Math.min(va, vb);
+        const maxIdx = Math.max(va, vb);
+        const key = `${minIdx}_${maxIdx}`;
+        if (!edgeMap.has(key)) {
+          edgeMap.set(key, { p1: ptA, p2: ptB, faces: [isFront] });
+        } else {
+          edgeMap.get(key).faces.push(isFront);
+        }
+      }
+    }
+
+    const silhouettes = [];
+    for (const entry of edgeMap.values()) {
+      if (entry.faces.length === 1) {
+        // Boundary edge of open shell
+        silhouettes.push({ p1: entry.p1, p2: entry.p2, isSilhouette: true });
+      } else if (entry.faces.length === 2) {
+        // Silhouette: front face meets back face relative to camera
+        if (entry.faces[0] !== entry.faces[1]) {
+          silhouettes.push({ p1: entry.p1, p2: entry.p2, isSilhouette: true });
+        }
+      }
+    }
+
+    return silhouettes;
   }
 
   /**
@@ -333,6 +466,17 @@ export class DrawingEngine {
           continue;
         }
 
+        // Avoid self-occlusion: if tri shares both endpoints with the edge, skip this triangle
+        const sharesP1 = (Math.hypot(tri.p1.x - p1Cam.x, tri.p1.y - p1Cam.y, tri.p1.z - p1Cam.z) < 1e-2 ||
+                          Math.hypot(tri.p2.x - p1Cam.x, tri.p2.y - p1Cam.y, tri.p2.z - p1Cam.z) < 1e-2 ||
+                          Math.hypot(tri.p3.x - p1Cam.x, tri.p3.y - p1Cam.y, tri.p3.z - p1Cam.z) < 1e-2);
+        const sharesP2 = (Math.hypot(tri.p1.x - p2Cam.x, tri.p1.y - p2Cam.y, tri.p1.z - p2Cam.z) < 1e-2 ||
+                          Math.hypot(tri.p2.x - p2Cam.x, tri.p2.y - p2Cam.y, tri.p2.z - p2Cam.z) < 1e-2 ||
+                          Math.hypot(tri.p3.x - p2Cam.x, tri.p3.y - p2Cam.y, tri.p3.z - p2Cam.z) < 1e-2);
+        if (sharesP1 && sharesP2) {
+          continue;
+        }
+
         // Barycentric coordinate test
         const v0x = tri.p3.x - tri.p1.x, v0y = tri.p3.y - tri.p1.y;
         const v1x = tri.p2.x - tri.p1.x, v1y = tri.p2.y - tri.p1.y;
@@ -351,7 +495,7 @@ export class DrawingEngine {
         if (u >= -eps && v >= -eps && (u + v) <= 1 + eps) {
           // Point is inside projected triangle. Check interpolated depth
           const triZ = tri.p1.z + u * (tri.p3.z - tri.p1.z) + v * (tri.p2.z - tri.p1.z);
-          if (triZ > qz + eps) {
+          if (triZ > qz + 1e-3) {
             pointOccluded = true;
             break;
           }
@@ -390,8 +534,8 @@ export class DrawingEngine {
     const availHeight = sheetSize.height - 2 * margin;
 
     // Determine common scaling factor to fit views comfortably on the sheet
-    const maxViewWidth = Math.max(frontView.bounds.width, topView.bounds.width, rightView.bounds.width, isoView.bounds.width, 10);
-    const maxViewHeight = Math.max(frontView.bounds.height, topView.bounds.height, rightView.bounds.height, isoView.bounds.height, 10);
+    const maxViewWidth = Math.max(frontView.bounds.width || 0, topView.bounds.width || 0, rightView.bounds.width || 0, isoView.bounds.width || 0, 10);
+    const maxViewHeight = Math.max(frontView.bounds.height || 0, topView.bounds.height || 0, rightView.bounds.height || 0, isoView.bounds.height || 0, 10);
 
     const targetWidth = availWidth * 0.35;
     const targetHeight = availHeight * 0.35;
@@ -405,12 +549,20 @@ export class DrawingEngine {
     const row2Y = margin + availHeight * 0.70;
 
     const layoutView = (viewData, centerX, centerY, label) => {
-      const offsetX = centerX - ((viewData.bounds.minX + viewData.bounds.maxX) / 2) * scale;
-      const offsetY = centerY - ((viewData.bounds.minY + viewData.bounds.maxY) / 2) * scale;
+      let offsetX = centerX - ((viewData.bounds.minX + viewData.bounds.maxX) / 2) * scale;
+      let offsetY = centerY - ((viewData.bounds.minY + viewData.bounds.maxY) / 2) * scale;
+
+      // Ensure view coordinates never drop below sheet margin (avoid negative coordinates)
+      if (viewData.bounds.minX * scale + offsetX < margin) {
+        offsetX = margin - viewData.bounds.minX * scale;
+      }
+      if (viewData.bounds.minY * scale + offsetY < margin) {
+        offsetY = margin - viewData.bounds.minY * scale;
+      }
 
       const transformLine = (line) => ({
-        p1: { x: line.p1.x * scale + offsetX, y: line.p1.y * scale + offsetY },
-        p2: { x: line.p2.x * scale + offsetX, y: line.p2.y * scale + offsetY },
+        p1: { x: Math.max(0, line.p1.x * scale + offsetX), y: Math.max(0, line.p1.y * scale + offsetY) },
+        p2: { x: Math.max(0, line.p2.x * scale + offsetX), y: Math.max(0, line.p2.y * scale + offsetY) },
         type: line.type,
       });
 
@@ -423,10 +575,10 @@ export class DrawingEngine {
         visible: viewData.visible.map(transformLine),
         hidden: viewData.hidden.map(transformLine),
         bounds: {
-          minX: viewData.bounds.minX * scale + offsetX,
-          maxX: viewData.bounds.maxX * scale + offsetX,
-          minY: viewData.bounds.minY * scale + offsetY,
-          maxY: viewData.bounds.maxY * scale + offsetY,
+          minX: Math.max(0, viewData.bounds.minX * scale + offsetX),
+          maxX: Math.max(0, viewData.bounds.maxX * scale + offsetX),
+          minY: Math.max(0, viewData.bounds.minY * scale + offsetY),
+          maxY: Math.max(0, viewData.bounds.maxY * scale + offsetY),
         },
       };
     };
@@ -491,29 +643,39 @@ export class DrawingEngine {
 
     if (frontView && frontView.bounds) {
       const fb = frontView.bounds;
-      // Width dimension (horizontal bottom)
-      dims.push(this.createLinearDimension(
-        { x: fb.minX, y: fb.maxY },
-        { x: fb.maxX, y: fb.maxY },
-        { offset: 12, orientation: 'horizontal', text: `${((fb.maxX - fb.minX) / scale).toFixed(1)} mm` }
-      ));
+      const width = fb.maxX - fb.minX;
+      const height = fb.maxY - fb.minY;
 
-      // Height dimension (vertical left)
-      dims.push(this.createLinearDimension(
-        { x: fb.minX, y: fb.minY },
-        { x: fb.minX, y: fb.maxY },
-        { offset: -12, orientation: 'vertical', text: `${((fb.maxY - fb.minY) / scale).toFixed(1)} mm` }
-      ));
+      // Width dimension (horizontal bottom) - only if geometry has extent
+      if (width > 1e-3) {
+        dims.push(this.createLinearDimension(
+          { x: fb.minX, y: fb.maxY },
+          { x: fb.maxX, y: fb.maxY },
+          { offset: 12, orientation: 'horizontal', text: `${(width / scale).toFixed(1)} mm` }
+        ));
+      }
+
+      // Height dimension (vertical left) - only if geometry has extent
+      if (height > 1e-3) {
+        dims.push(this.createLinearDimension(
+          { x: fb.minX, y: fb.minY },
+          { x: fb.minX, y: fb.maxY },
+          { offset: -12, orientation: 'vertical', text: `${(height / scale).toFixed(1)} mm` }
+        ));
+      }
     }
 
     if (topView && topView.bounds) {
       const tb = topView.bounds;
-      // Depth dimension (vertical right)
-      dims.push(this.createLinearDimension(
-        { x: tb.maxX, y: tb.minY },
-        { x: tb.maxX, y: tb.maxY },
-        { offset: 12, orientation: 'vertical', text: `${((tb.maxY - tb.minY) / scale).toFixed(1)} mm` }
-      ));
+      const depth = tb.maxY - tb.minY;
+      // Depth dimension (vertical right) - only if geometry has extent
+      if (depth > 1e-3) {
+        dims.push(this.createLinearDimension(
+          { x: tb.maxX, y: tb.minY },
+          { x: tb.maxX, y: tb.maxY },
+          { offset: 12, orientation: 'vertical', text: `${(depth / scale).toFixed(1)} mm` }
+        ));
+      }
     }
 
     return dims;
@@ -615,11 +777,12 @@ export class DrawingEngine {
    * @returns {string} SVG xml string
    */
   exportSVG(sheetData) {
+    if (!sheetData) return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 297 210" width="297mm" height="210mm"></svg>';
     const { sheetSize, border, titleBlock, views, dimensions, gdtFrames } = sheetData;
-    const w = sheetSize.width;
-    const h = sheetSize.height;
+    const w = Math.max(10, Number(sheetSize?.width) || 297);
+    const h = Math.max(10, Number(sheetSize?.height) || 210);
 
-    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}mm" height="${h}mm">\n`;
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w.toFixed(2)} ${h.toFixed(2)}" width="${w.toFixed(2)}mm" height="${h.toFixed(2)}mm">\n`;
     svg += `  <style>\n`;
     svg += `    .sheet-bg { fill: #ffffff; }\n`;
     svg += `    .border-outer { stroke: #000000; stroke-width: 0.7; fill: none; }\n`;
@@ -638,41 +801,48 @@ export class DrawingEngine {
 
     // 1. Background & Sheet Borders
     svg += `  <!-- Sheet Background & Borders -->\n`;
-    svg += `  <rect class="sheet-bg" x="0" y="0" width="${w}" height="${h}" />\n`;
-    svg += `  <rect class="border-outer" x="${border.x}" y="${border.y}" width="${border.width}" height="${border.height}" />\n`;
-    svg += `  <rect class="border-inner" x="${border.x + border.innerMargin}" y="${border.y + border.innerMargin}" width="${border.width - 2 * border.innerMargin}" height="${border.height - 2 * border.innerMargin}" />\n\n`;
+    svg += `  <rect class="sheet-bg" x="0" y="0" width="${w.toFixed(2)}" height="${h.toFixed(2)}" />\n`;
+    if (border) {
+      svg += `  <rect class="border-outer" x="${border.x.toFixed(2)}" y="${border.y.toFixed(2)}" width="${border.width.toFixed(2)}" height="${border.height.toFixed(2)}" />\n`;
+      svg += `  <rect class="border-inner" x="${(border.x + border.innerMargin).toFixed(2)}" y="${(border.y + border.innerMargin).toFixed(2)}" width="${(border.width - 2 * border.innerMargin).toFixed(2)}" height="${(border.height - 2 * border.innerMargin).toFixed(2)}" />\n\n`;
+    }
 
     // 2. Title Block
-    const tb = titleBlock;
-    svg += `  <!-- Engineering Title Block -->\n`;
-    svg += `  <g id="title-block">\n`;
-    svg += `    <rect class="gdt-rect" x="${tb.x}" y="${tb.y}" width="${tb.width}" height="${tb.height}" />\n`;
-    svg += `    <line class="tb-line" x1="${tb.x}" y1="${tb.y + 15}" x2="${tb.x + tb.width}" y2="${tb.y + 15}" />\n`;
-    svg += `    <line class="tb-line" x1="${tb.x}" y1="${tb.y + 28}" x2="${tb.x + tb.width}" y2="${tb.y + 28}" />\n`;
-    svg += `    <line class="tb-line" x1="${tb.x + 45}" y1="${tb.y + 15}" x2="${tb.x + 45}" y2="${tb.y + tb.height}" />\n`;
-    svg += `    <text class="tb-text-title" x="${tb.x + 5}" y="${tb.y + 10}">${tb.title}</text>\n`;
-    svg += `    <text class="tb-text-sm" x="${tb.x + 5}" y="${tb.y + 22}">PART NO: ${tb.partNumber}</text>\n`;
-    svg += `    <text class="tb-text-sm" x="${tb.x + 50}" y="${tb.y + 22}">MATERIAL: ${tb.material}</text>\n`;
-    svg += `    <text class="tb-text-sm" x="${tb.x + 5}" y="${tb.y + 35}">${tb.scaleText}</text>\n`;
-    svg += `    <text class="tb-text-sm" x="${tb.x + 50}" y="${tb.y + 35}">DATE: ${tb.date} | ${tb.revision}</text>\n`;
-    svg += `  </g>\n\n`;
+    if (titleBlock) {
+      const tb = titleBlock;
+      svg += `  <!-- Engineering Title Block -->\n`;
+      svg += `  <g id="title-block">\n`;
+      svg += `    <rect class="gdt-rect" x="${tb.x.toFixed(2)}" y="${tb.y.toFixed(2)}" width="${tb.width.toFixed(2)}" height="${tb.height.toFixed(2)}" />\n`;
+      svg += `    <line class="tb-line" x1="${tb.x.toFixed(2)}" y1="${(tb.y + 15).toFixed(2)}" x2="${(tb.x + tb.width).toFixed(2)}" y2="${(tb.y + 15).toFixed(2)}" />\n`;
+      svg += `    <line class="tb-line" x1="${tb.x.toFixed(2)}" y1="${(tb.y + 28).toFixed(2)}" x2="${(tb.x + tb.width).toFixed(2)}" y2="${(tb.y + 28).toFixed(2)}" />\n`;
+      svg += `    <line class="tb-line" x1="${(tb.x + 45).toFixed(2)}" y1="${(tb.y + 15).toFixed(2)}" x2="${(tb.x + 45).toFixed(2)}" y2="${(tb.y + tb.height).toFixed(2)}" />\n`;
+      svg += `    <text class="tb-text-title" x="${(tb.x + 5).toFixed(2)}" y="${(tb.y + 10).toFixed(2)}">${escapeXml(tb.title)}</text>\n`;
+      svg += `    <text class="tb-text-sm" x="${(tb.x + 5).toFixed(2)}" y="${(tb.y + 22).toFixed(2)}">PART NO: ${escapeXml(tb.partNumber)}</text>\n`;
+      svg += `    <text class="tb-text-sm" x="${(tb.x + 50).toFixed(2)}" y="${(tb.y + 22).toFixed(2)}">MATERIAL: ${escapeXml(tb.material)}</text>\n`;
+      svg += `    <text class="tb-text-sm" x="${(tb.x + 5).toFixed(2)}" y="${(tb.y + 35).toFixed(2)}">${escapeXml(tb.scaleText)}</text>\n`;
+      svg += `    <text class="tb-text-sm" x="${(tb.x + 50).toFixed(2)}" y="${(tb.y + 35).toFixed(2)}">DATE: ${escapeXml(tb.date)} | ${escapeXml(tb.revision)}</text>\n`;
+      svg += `  </g>\n\n`;
+    }
 
     // 3. Projections & Edge Geometry
-    svg += `  <!-- Orthographic Views -->\n`;
-    for (const v of views) {
-      svg += `  <g id="${v.label.replace(/\s+/g, '_')}">\n`;
-      svg += `    <text class="view-label" x="${v.centerX}" y="${v.bounds.maxY + 8}">${v.label}</text>\n`;
+    if (views) {
+      svg += `  <!-- Orthographic Views -->\n`;
+      for (const v of views) {
+        const safeId = escapeXml(v.label.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, ''));
+        svg += `  <g id="${safeId}">\n`;
+        svg += `    <text class="view-label" x="${v.centerX.toFixed(2)}" y="${(v.bounds.maxY + 8).toFixed(2)}">${escapeXml(v.label)}</text>\n`;
 
-      // Hidden lines first
-      for (const line of v.hidden) {
-        svg += `    <line class="hidden-line" x1="${line.p1.x.toFixed(2)}" y1="${line.p1.y.toFixed(2)}" x2="${line.p2.x.toFixed(2)}" y2="${line.p2.y.toFixed(2)}" />\n`;
-      }
+        // Hidden lines first
+        for (const line of (v.hidden || [])) {
+          svg += `    <line class="hidden-line" x1="${line.p1.x.toFixed(2)}" y1="${line.p1.y.toFixed(2)}" x2="${line.p2.x.toFixed(2)}" y2="${line.p2.y.toFixed(2)}" />\n`;
+        }
 
-      // Visible lines
-      for (const line of v.visible) {
-        svg += `    <line class="visible-line" x1="${line.p1.x.toFixed(2)}" y1="${line.p1.y.toFixed(2)}" x2="${line.p2.x.toFixed(2)}" y2="${line.p2.y.toFixed(2)}" />\n`;
+        // Visible lines
+        for (const line of (v.visible || [])) {
+          svg += `    <line class="visible-line" x1="${line.p1.x.toFixed(2)}" y1="${line.p1.y.toFixed(2)}" x2="${line.p2.x.toFixed(2)}" y2="${line.p2.y.toFixed(2)}" />\n`;
+        }
+        svg += `  </g>\n`;
       }
-      svg += `  </g>\n`;
     }
 
     // 4. Dimensions
@@ -682,7 +852,7 @@ export class DrawingEngine {
         svg += `    <line class="dim-line" x1="${d.extLine1.p1.x.toFixed(2)}" y1="${d.extLine1.p1.y.toFixed(2)}" x2="${d.extLine1.p2.x.toFixed(2)}" y2="${d.extLine1.p2.y.toFixed(2)}" />\n`;
         svg += `    <line class="dim-line" x1="${d.extLine2.p1.x.toFixed(2)}" y1="${d.extLine2.p1.y.toFixed(2)}" x2="${d.extLine2.p2.x.toFixed(2)}" y2="${d.extLine2.p2.y.toFixed(2)}" />\n`;
         svg += `    <line class="dim-line" x1="${d.dimLine.p1.x.toFixed(2)}" y1="${d.dimLine.p1.y.toFixed(2)}" x2="${d.dimLine.p2.x.toFixed(2)}" y2="${d.dimLine.p2.y.toFixed(2)}" />\n`;
-        svg += `    <text class="dim-text" x="${d.textPos.x.toFixed(2)}" y="${d.textPos.y.toFixed(2)}">${d.text}</text>\n`;
+        svg += `    <text class="dim-text" x="${d.textPos.x.toFixed(2)}" y="${d.textPos.y.toFixed(2)}">${escapeXml(d.text)}</text>\n`;
       }
       svg += `  </g>\n`;
     }
@@ -695,8 +865,8 @@ export class DrawingEngine {
           svg += `    <g transform="translate(${f.x.toFixed(2)}, ${f.y.toFixed(2)})">\n`;
           let curX = 0;
           for (const c of f.compartments) {
-            svg += `      <rect class="gdt-rect" x="${curX}" y="0" width="${c.width}" height="${f.height}" />\n`;
-            svg += `      <text class="gdt-text" x="${curX + c.width / 2}" y="${f.height * 0.68}">${c.label}</text>\n`;
+            svg += `      <rect class="gdt-rect" x="${curX.toFixed(2)}" y="0" width="${c.width.toFixed(2)}" height="${f.height.toFixed(2)}" />\n`;
+            svg += `      <text class="gdt-text" x="${(curX + c.width / 2).toFixed(2)}" y="${(f.height * 0.68).toFixed(2)}">${escapeXml(c.label)}</text>\n`;
             curX += c.width;
           }
           svg += `    </g>\n`;
@@ -704,8 +874,8 @@ export class DrawingEngine {
           svg += `    <g transform="translate(${f.x.toFixed(2)}, ${f.y.toFixed(2)})">\n`;
           svg += `      <polygon points="0,0 -3,5 3,5" fill="#000" />\n`;
           svg += `      <line x1="0" y1="5" x2="0" y2="9" stroke="#000" stroke-width="0.35" />\n`;
-          svg += `      <rect class="gdt-rect" x="-4" y="9" width="${f.boxWidth}" height="${f.boxHeight}" />\n`;
-          svg += `      <text class="gdt-text" x="0" y="15">${f.letter}</text>\n`;
+          svg += `      <rect class="gdt-rect" x="-4" y="9" width="${f.boxWidth.toFixed(2)}" height="${f.boxHeight.toFixed(2)}" />\n`;
+          svg += `      <text class="gdt-text" x="0" y="15">${escapeXml(f.letter)}</text>\n`;
           svg += `    </g>\n`;
         }
       }

@@ -6,6 +6,57 @@ import * as THREE from 'three';
 import { generateId, EPSILON } from '../utils/math.js';
 
 // ============================================================================
+// Safe Numerical & Vector Utilities
+// ============================================================================
+
+export function safeNormalize(v, fallback = new THREE.Vector3(0, 0, 1)) {
+  if (!v || typeof v.x !== 'number') return fallback.clone();
+  const x = isNaN(v.x) || !isFinite(v.x) ? 0 : v.x;
+  const y = isNaN(v.y) || !isFinite(v.y) ? 0 : v.y;
+  const z = isNaN(v.z) || !isFinite(v.z) ? 0 : v.z;
+  const lenSq = x * x + y * y + z * z;
+  if (lenSq < 1e-14 || isNaN(lenSq) || !isFinite(lenSq)) {
+    return fallback.clone();
+  }
+  const invLen = 1 / Math.sqrt(lenSq);
+  return new THREE.Vector3(x * invLen, y * invLen, z * invLen);
+}
+
+export function sanitizePoint(p, defaultVal = new THREE.Vector3(0, 0, 0)) {
+  if (!p) return defaultVal.clone();
+  const x = typeof p.x === 'number' && !isNaN(p.x) && isFinite(p.x) ? p.x : defaultVal.x;
+  const y = typeof p.y === 'number' && !isNaN(p.y) && isFinite(p.y) ? p.y : defaultVal.y;
+  const z = typeof p.z === 'number' && !isNaN(p.z) && isFinite(p.z) ? p.z : defaultVal.z;
+  return new THREE.Vector3(x, y, z);
+}
+
+export function removeConsecutiveDuplicates(pts, tol = 1e-5) {
+  if (!pts || pts.length === 0) return [];
+  const cleaned = [];
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (!cleaned.length) {
+      cleaned.push(p);
+    } else {
+      const prev = cleaned[cleaned.length - 1];
+      const d = p.distanceTo ? p.distanceTo(prev) : Math.hypot(p.x - prev.x, p.y - prev.y, (p.z || 0) - (prev.z || 0));
+      if (d > tol) {
+        cleaned.push(p);
+      }
+    }
+  }
+  if (cleaned.length > 1) {
+    const first = cleaned[0];
+    const last = cleaned[cleaned.length - 1];
+    const d = last.distanceTo ? last.distanceTo(first) : Math.hypot(last.x - first.x, last.y - first.y, (last.z || 0) - (first.z || 0));
+    if (d <= tol) {
+      cleaned.pop();
+    }
+  }
+  return cleaned;
+}
+
+// ============================================================================
 // Curve Definitions
 // ============================================================================
 
@@ -36,7 +87,8 @@ export class Curve {
     const t1 = Math.min(1, t + dt);
     const p0 = this.pointAt(t0);
     const p1 = this.pointAt(t1);
-    return new THREE.Vector3().subVectors(p1, p0).normalize();
+    const diff = new THREE.Vector3().subVectors(p1, p0);
+    return safeNormalize(diff, new THREE.Vector3(0, 0, 1));
   }
 
   length(samples = 20) {
@@ -47,7 +99,7 @@ export class Curve {
       len += prev.distanceTo(curr);
       prev = curr;
     }
-    return len;
+    return isNaN(len) || !isFinite(len) ? 0 : Math.max(0, len);
   }
 
   clone() {
@@ -61,16 +113,18 @@ export class Curve {
 export class LineCurve extends Curve {
   constructor(start, end) {
     super(CURVE_TYPES.LINE);
-    this.start = start instanceof THREE.Vector3 ? start.clone() : new THREE.Vector3(start.x, start.y, start.z);
-    this.end = end instanceof THREE.Vector3 ? end.clone() : new THREE.Vector3(end.x, end.y, end.z);
+    this.start = sanitizePoint(start);
+    this.end = sanitizePoint(end);
   }
 
   pointAt(t) {
-    return new THREE.Vector3().lerpVectors(this.start, this.end, t);
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+    return new THREE.Vector3().lerpVectors(this.start, this.end, clampedT);
   }
 
   tangentAt(t) {
-    return new THREE.Vector3().subVectors(this.end, this.start).normalize();
+    const diff = new THREE.Vector3().subVectors(this.end, this.start);
+    return safeNormalize(diff, new THREE.Vector3(0, 0, 1));
   }
 
   length() {
@@ -88,24 +142,29 @@ export class LineCurve extends Curve {
 export class ArcCurve extends Curve {
   constructor(center, radius, startAngle = 0, endAngle = Math.PI * 2, normal = new THREE.Vector3(0, 0, 1), refX = null) {
     super(CURVE_TYPES.ARC);
-    this.center = center instanceof THREE.Vector3 ? center.clone() : new THREE.Vector3(center.x, center.y, center.z);
-    this.radius = Math.max(1e-7, radius);
-    this.startAngle = startAngle;
-    this.endAngle = endAngle;
-    this.normal = normal.clone().normalize();
+    this.center = sanitizePoint(center);
+    this.radius = Math.max(1e-7, isNaN(radius) ? 1e-7 : Math.abs(radius));
+    this.startAngle = isNaN(startAngle) ? 0 : startAngle;
+    this.endAngle = isNaN(endAngle) ? Math.PI * 2 : endAngle;
+    this.normal = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
 
-    if (refX) {
-      this.refX = refX.clone().normalize();
+    if (refX && refX.lengthSq && refX.lengthSq() > 1e-8) {
+      this.refX = safeNormalize(refX, new THREE.Vector3(1, 0, 0));
     } else {
       // Pick orthogonal vector
       const arbitrary = Math.abs(this.normal.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-      this.refX = new THREE.Vector3().crossVectors(this.normal, arbitrary).normalize();
+      let cross = new THREE.Vector3().crossVectors(this.normal, arbitrary);
+      if (cross.lengthSq() < 1e-8) {
+        cross = new THREE.Vector3().crossVectors(this.normal, new THREE.Vector3(0, 1, 0));
+      }
+      this.refX = safeNormalize(cross, new THREE.Vector3(1, 0, 0));
     }
-    this.refY = new THREE.Vector3().crossVectors(this.normal, this.refX).normalize();
+    this.refY = safeNormalize(new THREE.Vector3().crossVectors(this.normal, this.refX), new THREE.Vector3(0, 1, 0));
   }
 
   pointAt(t) {
-    const angle = this.startAngle + t * (this.endAngle - this.startAngle);
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+    const angle = this.startAngle + clampedT * (this.endAngle - this.startAngle);
     const cos = Math.cos(angle);
     const sin = Math.sin(angle);
     return new THREE.Vector3()
@@ -115,14 +174,15 @@ export class ArcCurve extends Curve {
   }
 
   tangentAt(t) {
-    const angle = this.startAngle + t * (this.endAngle - this.startAngle);
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+    const angle = this.startAngle + clampedT * (this.endAngle - this.startAngle);
     const cos = Math.cos(angle);
     const sin = Math.sin(angle);
     const sign = this.endAngle >= this.startAngle ? 1 : -1;
-    return new THREE.Vector3()
+    const tan = new THREE.Vector3()
       .addScaledVector(this.refX, -sin * sign)
-      .addScaledVector(this.refY, cos * sign)
-      .normalize();
+      .addScaledVector(this.refY, cos * sign);
+    return safeNormalize(tan, new THREE.Vector3(0, 1, 0));
   }
 
   length() {
@@ -138,19 +198,20 @@ export class ArcCurve extends Curve {
  * 3D NURBS / B-Spline Curve
  */
 export class NurbsCurve extends Curve {
-  constructor(controlPoints, degree = 3, knots = null, weights = null) {
+  constructor(controlPoints = [], degree = 3, knots = null, weights = null) {
     super(CURVE_TYPES.NURBS);
-    this.controlPoints = controlPoints.map(p =>
-      p instanceof THREE.Vector3 ? p.clone() : new THREE.Vector3(p.x, p.y, p.z)
-    );
-    this.degree = degree;
+    this.controlPoints = (controlPoints || []).map(p => sanitizePoint(p));
+    if (this.controlPoints.length < 2) {
+      this.controlPoints = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(1, 0, 0)];
+    }
+    this.degree = Math.min(Math.max(1, degree), this.controlPoints.length - 1);
     const n = this.controlPoints.length - 1;
     const p = this.degree;
 
     // Weights (default: 1.0)
-    this.weights = weights && weights.length === controlPoints.length
-      ? weights.slice()
-      : new Array(controlPoints.length).fill(1.0);
+    this.weights = weights && weights.length === this.controlPoints.length
+      ? weights.map(w => (typeof w === 'number' && !isNaN(w) && w > 0 ? w : 1.0))
+      : new Array(this.controlPoints.length).fill(1.0);
 
     // Knots (clamped uniform knot vector by default)
     if (knots && knots.length === n + p + 2) {
@@ -167,7 +228,7 @@ export class NurbsCurve extends Curve {
   }
 
   pointAt(t) {
-    const clampedT = Math.max(0, Math.min(1, t));
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
     const kStart = this.knots[this.degree];
     const kEnd = this.knots[this.knots.length - 1 - this.degree];
     const u = kStart + clampedT * (kEnd - kStart);
@@ -196,9 +257,9 @@ export class NurbsCurve extends Curve {
     // Weighted control points in homogeneous coords (wx, wy, wz, w)
     const d = [];
     for (let j = 0; j <= p; j++) {
-      const idx = k - p + j;
+      const idx = Math.max(0, Math.min(n, k - p + j));
       const cp = this.controlPoints[idx];
-      const w = this.weights[idx];
+      const w = this.weights[idx] || 1.0;
       d[j] = new THREE.Vector4(cp.x * w, cp.y * w, cp.z * w, w);
     }
 
@@ -212,8 +273,9 @@ export class NurbsCurve extends Curve {
     }
 
     const res = d[p];
-    const w = res.w !== 0 ? res.w : 1;
-    return new THREE.Vector3(res.x / w, res.y / w, res.z / w);
+    const w = res && Math.abs(res.w) > 1e-12 ? res.w : 1;
+    const pt = new THREE.Vector3(res.x / w, res.y / w, res.z / w);
+    return sanitizePoint(pt);
   }
 
   clone() {
@@ -255,7 +317,8 @@ export class Surface {
     const pv = this.pointAt(u, v + dv);
     const tu = new THREE.Vector3().subVectors(pu, p);
     const tv = new THREE.Vector3().subVectors(pv, p);
-    return new THREE.Vector3().crossVectors(tu, tv).normalize();
+    const cross = new THREE.Vector3().crossVectors(tu, tv);
+    return safeNormalize(cross, new THREE.Vector3(0, 0, 1));
   }
 
   project(point) {
@@ -273,24 +336,30 @@ export class Surface {
 export class PlaneSurface extends Surface {
   constructor(origin = new THREE.Vector3(0, 0, 0), normal = new THREE.Vector3(0, 0, 1), uDir = null, vDir = null) {
     super(SURFACE_TYPES.PLANE);
-    this.origin = origin instanceof THREE.Vector3 ? origin.clone() : new THREE.Vector3(origin.x, origin.y, origin.z);
-    this.normal = normal.clone().normalize();
+    this.origin = sanitizePoint(origin);
+    this.normal = safeNormalize(normal, new THREE.Vector3(0, 0, 1));
 
-    if (uDir && vDir) {
-      this.uDir = uDir.clone().normalize();
-      this.vDir = vDir.clone().normalize();
+    if (uDir && vDir && uDir.lengthSq && uDir.lengthSq() > 1e-8 && vDir.lengthSq && vDir.lengthSq() > 1e-8) {
+      this.uDir = safeNormalize(uDir, new THREE.Vector3(1, 0, 0));
+      this.vDir = safeNormalize(vDir, new THREE.Vector3(0, 1, 0));
     } else {
       const arb = Math.abs(this.normal.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-      this.uDir = new THREE.Vector3().crossVectors(this.normal, arb).normalize();
-      this.vDir = new THREE.Vector3().crossVectors(this.normal, this.uDir).normalize();
+      let cross = new THREE.Vector3().crossVectors(this.normal, arb);
+      if (cross.lengthSq() < 1e-8) {
+        cross = new THREE.Vector3().crossVectors(this.normal, new THREE.Vector3(0, 1, 0));
+      }
+      this.uDir = safeNormalize(cross, new THREE.Vector3(1, 0, 0));
+      this.vDir = safeNormalize(new THREE.Vector3().crossVectors(this.normal, this.uDir), new THREE.Vector3(0, 1, 0));
     }
   }
 
   pointAt(u, v) {
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
     return new THREE.Vector3()
       .copy(this.origin)
-      .addScaledVector(this.uDir, u)
-      .addScaledVector(this.vDir, v);
+      .addScaledVector(this.uDir, cu)
+      .addScaledVector(this.vDir, cv);
   }
 
   normalAt(u, v) {
@@ -298,9 +367,10 @@ export class PlaneSurface extends Surface {
   }
 
   project(point) {
-    const diff = new THREE.Vector3().subVectors(point, this.origin);
+    const pt = sanitizePoint(point);
+    const diff = new THREE.Vector3().subVectors(pt, this.origin);
     const dist = diff.dot(this.normal);
-    const projectedPoint = new THREE.Vector3().subVectors(point, this.normal.clone().multiplyScalar(dist));
+    const projectedPoint = new THREE.Vector3().subVectors(pt, this.normal.clone().multiplyScalar(dist));
     const u = new THREE.Vector3().subVectors(projectedPoint, this.origin).dot(this.uDir);
     const v = new THREE.Vector3().subVectors(projectedPoint, this.origin).dot(this.vDir);
     return { point: projectedPoint, u, v, distance: dist };
@@ -317,37 +387,43 @@ export class PlaneSurface extends Surface {
 export class CylinderSurface extends Surface {
   constructor(origin = new THREE.Vector3(0, 0, 0), axis = new THREE.Vector3(0, 0, 1), radius = 10, refDir = null) {
     super(SURFACE_TYPES.CYLINDER);
-    this.origin = origin.clone();
-    this.axis = axis.clone().normalize();
-    this.radius = Math.max(1e-7, radius);
+    this.origin = sanitizePoint(origin);
+    this.axis = safeNormalize(axis, new THREE.Vector3(0, 0, 1));
+    this.radius = Math.max(1e-7, isNaN(radius) ? 1e-7 : Math.abs(radius));
 
-    if (refDir) {
-      this.refX = refDir.clone().normalize();
+    if (refDir && refDir.lengthSq && refDir.lengthSq() > 1e-8) {
+      this.refX = safeNormalize(refDir, new THREE.Vector3(1, 0, 0));
     } else {
       const arb = Math.abs(this.axis.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-      this.refX = new THREE.Vector3().crossVectors(this.axis, arb).normalize();
+      let cross = new THREE.Vector3().crossVectors(this.axis, arb);
+      if (cross.lengthSq() < 1e-8) {
+        cross = new THREE.Vector3().crossVectors(this.axis, new THREE.Vector3(0, 1, 0));
+      }
+      this.refX = safeNormalize(cross, new THREE.Vector3(1, 0, 0));
     }
-    this.refY = new THREE.Vector3().crossVectors(this.axis, this.refX).normalize();
+    this.refY = safeNormalize(new THREE.Vector3().crossVectors(this.axis, this.refX), new THREE.Vector3(0, 1, 0));
   }
 
   pointAt(u, v) {
-    // u: angle in [0, 2*PI], v: linear elevation along axis
-    const cos = Math.cos(u);
-    const sin = Math.sin(u);
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
+    const cos = Math.cos(cu);
+    const sin = Math.sin(cu);
     return new THREE.Vector3()
       .copy(this.origin)
-      .addScaledVector(this.axis, v)
+      .addScaledVector(this.axis, cv)
       .addScaledVector(this.refX, this.radius * cos)
       .addScaledVector(this.refY, this.radius * sin);
   }
 
   normalAt(u, v) {
-    const cos = Math.cos(u);
-    const sin = Math.sin(u);
-    return new THREE.Vector3()
+    const cu = isNaN(u) ? 0 : u;
+    const cos = Math.cos(cu);
+    const sin = Math.sin(cu);
+    const n = new THREE.Vector3()
       .addScaledVector(this.refX, cos)
-      .addScaledVector(this.refY, sin)
-      .normalize();
+      .addScaledVector(this.refY, sin);
+    return safeNormalize(n, this.refX);
   }
 
   clone() {
@@ -361,42 +437,49 @@ export class CylinderSurface extends Surface {
 export class ConeSurface extends Surface {
   constructor(apex = new THREE.Vector3(0, 0, 0), axis = new THREE.Vector3(0, 0, 1), halfAngle = Math.PI / 6, refDir = null) {
     super(SURFACE_TYPES.CONE);
-    this.apex = apex.clone();
-    this.axis = axis.clone().normalize();
-    this.halfAngle = halfAngle;
+    this.apex = sanitizePoint(apex);
+    this.axis = safeNormalize(axis, new THREE.Vector3(0, 0, 1));
+    this.halfAngle = Math.max(1e-4, Math.min(Math.PI / 2 - 1e-4, isNaN(halfAngle) ? Math.PI / 6 : halfAngle));
 
-    if (refDir) {
-      this.refX = refDir.clone().normalize();
+    if (refDir && refDir.lengthSq && refDir.lengthSq() > 1e-8) {
+      this.refX = safeNormalize(refDir, new THREE.Vector3(1, 0, 0));
     } else {
       const arb = Math.abs(this.axis.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-      this.refX = new THREE.Vector3().crossVectors(this.axis, arb).normalize();
+      let cross = new THREE.Vector3().crossVectors(this.axis, arb);
+      if (cross.lengthSq() < 1e-8) {
+        cross = new THREE.Vector3().crossVectors(this.axis, new THREE.Vector3(0, 1, 0));
+      }
+      this.refX = safeNormalize(cross, new THREE.Vector3(1, 0, 0));
     }
-    this.refY = new THREE.Vector3().crossVectors(this.axis, this.refX).normalize();
+    this.refY = safeNormalize(new THREE.Vector3().crossVectors(this.axis, this.refX), new THREE.Vector3(0, 1, 0));
   }
 
   pointAt(u, v) {
-    // u: angle in [0, 2*PI], v: distance from apex along axis
-    const r = Math.abs(v * Math.tan(this.halfAngle));
-    const cos = Math.cos(u);
-    const sin = Math.sin(u);
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
+    const r = Math.abs(cv * Math.tan(this.halfAngle));
+    const cos = Math.cos(cu);
+    const sin = Math.sin(cu);
     return new THREE.Vector3()
       .copy(this.apex)
-      .addScaledVector(this.axis, v)
+      .addScaledVector(this.axis, cv)
       .addScaledVector(this.refX, r * cos)
       .addScaledVector(this.refY, r * sin);
   }
 
   normalAt(u, v) {
-    const cos = Math.cos(u);
-    const sin = Math.sin(u);
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
+    const cos = Math.cos(cu);
+    const sin = Math.sin(cu);
     const radNormal = new THREE.Vector3()
       .addScaledVector(this.refX, cos)
       .addScaledVector(this.refY, sin);
-    const sign = v >= 0 ? 1 : -1;
-    return new THREE.Vector3()
+    const sign = cv >= 0 ? 1 : -1;
+    const norm = new THREE.Vector3()
       .addScaledVector(radNormal, Math.cos(this.halfAngle))
-      .addScaledVector(this.axis, -Math.sin(this.halfAngle) * sign)
-      .normalize();
+      .addScaledVector(this.axis, -Math.sin(this.halfAngle) * sign);
+    return safeNormalize(norm, this.refX);
   }
 
   clone() {
@@ -410,36 +493,43 @@ export class ConeSurface extends Surface {
 export class TorusSurface extends Surface {
   constructor(center = new THREE.Vector3(0, 0, 0), axis = new THREE.Vector3(0, 0, 1), majorRadius = 20, minorRadius = 5, refDir = null) {
     super(SURFACE_TYPES.TORUS);
-    this.center = center.clone();
-    this.axis = axis.clone().normalize();
-    this.majorRadius = majorRadius;
-    this.minorRadius = minorRadius;
+    this.center = sanitizePoint(center);
+    this.axis = safeNormalize(axis, new THREE.Vector3(0, 0, 1));
+    this.majorRadius = Math.max(1e-4, isNaN(majorRadius) ? 20 : Math.abs(majorRadius));
+    this.minorRadius = Math.max(1e-5, Math.min(this.majorRadius * 0.999, isNaN(minorRadius) ? 5 : Math.abs(minorRadius)));
 
-    if (refDir) {
-      this.refX = refDir.clone().normalize();
+    if (refDir && refDir.lengthSq && refDir.lengthSq() > 1e-8) {
+      this.refX = safeNormalize(refDir, new THREE.Vector3(1, 0, 0));
     } else {
       const arb = Math.abs(this.axis.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-      this.refX = new THREE.Vector3().crossVectors(this.axis, arb).normalize();
+      let cross = new THREE.Vector3().crossVectors(this.axis, arb);
+      if (cross.lengthSq() < 1e-8) {
+        cross = new THREE.Vector3().crossVectors(this.axis, new THREE.Vector3(0, 1, 0));
+      }
+      this.refX = safeNormalize(cross, new THREE.Vector3(1, 0, 0));
     }
-    this.refY = new THREE.Vector3().crossVectors(this.axis, this.refX).normalize();
+    this.refY = safeNormalize(new THREE.Vector3().crossVectors(this.axis, this.refX), new THREE.Vector3(0, 1, 0));
   }
 
   pointAt(u, v) {
-    // u: toroidal angle (major circle), v: poloidal angle (minor tube circle)
-    const cosU = Math.cos(u);
-    const sinU = Math.sin(u);
-    const cosV = Math.cos(v);
-    const sinV = Math.sin(v);
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
+    const cosU = Math.cos(cu);
+    const sinU = Math.sin(cu);
+    const cosV = Math.cos(cv);
+    const sinV = Math.sin(cv);
 
     const tubeCenter = new THREE.Vector3()
       .copy(this.center)
       .addScaledVector(this.refX, this.majorRadius * cosU)
       .addScaledVector(this.refY, this.majorRadius * sinU);
 
-    const radialDir = new THREE.Vector3()
-      .addScaledVector(this.refX, cosU)
-      .addScaledVector(this.refY, sinU)
-      .normalize();
+    const radialDir = safeNormalize(
+      new THREE.Vector3()
+        .addScaledVector(this.refX, cosU)
+        .addScaledVector(this.refY, sinU),
+      this.refX
+    );
 
     return tubeCenter
       .addScaledVector(radialDir, this.minorRadius * cosV)
@@ -447,20 +537,24 @@ export class TorusSurface extends Surface {
   }
 
   normalAt(u, v) {
-    const cosU = Math.cos(u);
-    const sinU = Math.sin(u);
-    const cosV = Math.cos(v);
-    const sinV = Math.sin(v);
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
+    const cosU = Math.cos(cu);
+    const sinU = Math.sin(cu);
+    const cosV = Math.cos(cv);
+    const sinV = Math.sin(cv);
 
-    const radialDir = new THREE.Vector3()
-      .addScaledVector(this.refX, cosU)
-      .addScaledVector(this.refY, sinU)
-      .normalize();
+    const radialDir = safeNormalize(
+      new THREE.Vector3()
+        .addScaledVector(this.refX, cosU)
+        .addScaledVector(this.refY, sinU),
+      this.refX
+    );
 
-    return new THREE.Vector3()
+    const norm = new THREE.Vector3()
       .addScaledVector(radialDir, cosV)
-      .addScaledVector(this.axis, sinV)
-      .normalize();
+      .addScaledVector(this.axis, sinV);
+    return safeNormalize(norm, radialDir);
   }
 
   clone() {
@@ -474,16 +568,17 @@ export class TorusSurface extends Surface {
 export class SphereSurface extends Surface {
   constructor(center = new THREE.Vector3(0, 0, 0), radius = 10) {
     super(SURFACE_TYPES.SPHERE);
-    this.center = center.clone();
-    this.radius = Math.max(1e-7, radius);
+    this.center = sanitizePoint(center);
+    this.radius = Math.max(1e-7, isNaN(radius) ? 10 : Math.abs(radius));
   }
 
   pointAt(u, v) {
-    // u: longitude [0, 2*PI], v: latitude [-PI/2, PI/2]
-    const cosV = Math.cos(v);
-    const sinV = Math.sin(v);
-    const cosU = Math.cos(u);
-    const sinU = Math.sin(u);
+    const cu = isNaN(u) ? 0 : u;
+    const cv = isNaN(v) ? 0 : v;
+    const cosV = Math.cos(cv);
+    const sinV = Math.sin(cv);
+    const cosU = Math.cos(cu);
+    const sinU = Math.sin(cu);
     return new THREE.Vector3(
       this.center.x + this.radius * cosV * cosU,
       this.center.y + this.radius * cosV * sinU,
@@ -493,7 +588,8 @@ export class SphereSurface extends Surface {
 
   normalAt(u, v) {
     const pt = this.pointAt(u, v);
-    return new THREE.Vector3().subVectors(pt, this.center).normalize();
+    const diff = new THREE.Vector3().subVectors(pt, this.center);
+    return safeNormalize(diff, new THREE.Vector3(0, 0, 1));
   }
 
   clone() {
@@ -511,7 +607,7 @@ export class SphereSurface extends Surface {
 export class Vertex {
   constructor(point, id = null) {
     this.id = id || generateId('vert');
-    this.point = point instanceof THREE.Vector3 ? point.clone() : new THREE.Vector3(point.x, point.y, point.z);
+    this.point = sanitizePoint(point);
     this.incidentEdges = new Set();
   }
 
@@ -524,7 +620,7 @@ export class Vertex {
   }
 
   distanceTo(other) {
-    const p = other instanceof Vertex ? other.point : other;
+    const p = other instanceof Vertex ? other.point : sanitizePoint(other);
     return this.point.distanceTo(p);
   }
 
@@ -554,7 +650,7 @@ export class Edge {
     this.id = id || generateId('edge');
     this.startVertex = startVertex;
     this.endVertex = endVertex;
-    this.curve = curve || new LineCurve(startVertex.point, endVertex.point);
+    this.curve = curve || (startVertex && endVertex ? new LineCurve(startVertex.point, endVertex.point) : null);
     this.adjacentFaces = new Set();
     this.coedges = [];
 
@@ -578,20 +674,26 @@ export class Edge {
 
   length() {
     if (this.curve) return this.curve.length();
+    if (!this.startVertex || !this.endVertex) return 0;
     return this.startVertex.point.distanceTo(this.endVertex.point);
   }
 
   pointAt(t) {
-    if (this.curve) return this.curve.pointAt(t);
-    return new THREE.Vector3().lerpVectors(this.startVertex.point, this.endVertex.point, t);
+    const clampedT = isNaN(t) ? 0 : Math.max(0, Math.min(1, t));
+    if (this.curve) return this.curve.pointAt(clampedT);
+    if (!this.startVertex || !this.endVertex) return new THREE.Vector3(0, 0, 0);
+    return new THREE.Vector3().lerpVectors(this.startVertex.point, this.endVertex.point, clampedT);
   }
 
   tangentAt(t) {
     if (this.curve) return this.curve.tangentAt(t);
-    return new THREE.Vector3().subVectors(this.endVertex.point, this.startVertex.point).normalize();
+    if (!this.startVertex || !this.endVertex) return new THREE.Vector3(0, 0, 1);
+    const diff = new THREE.Vector3().subVectors(this.endVertex.point, this.startVertex.point);
+    return safeNormalize(diff, new THREE.Vector3(0, 0, 1));
   }
 
   isClosed(tol = 1e-5) {
+    if (!this.startVertex || !this.endVertex) return false;
     return this.startVertex === this.endVertex || this.startVertex.distanceTo(this.endVertex) < tol;
   }
 
@@ -600,8 +702,7 @@ export class Edge {
     this.startVertex = this.endVertex;
     this.endVertex = tmp;
     if (this.curve && this.curve.clone) {
-      // If linear, reverse start and end
-      if (this.curve.type === CURVE_TYPES.LINE) {
+      if (this.curve.type === CURVE_TYPES.LINE && this.startVertex && this.endVertex) {
         this.curve = new LineCurve(this.startVertex.point, this.endVertex.point);
       }
     }
@@ -627,10 +728,12 @@ export class CoEdge {
   }
 
   get startVertex() {
+    if (!this.edge) return null;
     return this.orientation ? this.edge.startVertex : this.edge.endVertex;
   }
 
   get endVertex() {
+    if (!this.edge) return null;
     return this.orientation ? this.edge.endVertex : this.edge.startVertex;
   }
 
@@ -639,11 +742,13 @@ export class CoEdge {
   }
 
   pointAt(t) {
+    if (!this.edge) return new THREE.Vector3(0, 0, 0);
     const param = this.orientation ? t : (1 - t);
     return this.edge.pointAt(param);
   }
 
   tangentAt(t) {
+    if (!this.edge) return new THREE.Vector3(0, 0, 1);
     const param = this.orientation ? t : (1 - t);
     const tan = this.edge.tangentAt(param);
     return this.orientation ? tan : tan.clone().negate();
@@ -683,11 +788,11 @@ export class Loop {
   }
 
   getVertices() {
-    return this.coedges.map(ce => ce.startVertex);
+    return this.coedges.map(ce => ce.startVertex).filter(Boolean);
   }
 
   getEdges() {
-    return this.coedges.map(ce => ce.edge);
+    return this.coedges.map(ce => ce.edge).filter(Boolean);
   }
 
   isClosed(tol = 1e-4) {
@@ -695,6 +800,7 @@ export class Loop {
     for (let i = 0; i < this.coedges.length; i++) {
       const curr = this.coedges[i];
       const next = this.coedges[(i + 1) % this.coedges.length];
+      if (!curr.endVertex || !next.startVertex) return false;
       if (curr.endVertex.distanceTo(next.startVertex) > tol) {
         return false;
       }
@@ -714,7 +820,8 @@ export class Loop {
       const v1 = verts[(i + 1) % verts.length];
       areaVec.add(new THREE.Vector3().crossVectors(v0, v1));
     }
-    return Math.abs(areaVec.dot(n) * 0.5);
+    const dot = areaVec.dot(n) * 0.5;
+    return isNaN(dot) ? 0 : Math.abs(dot);
   }
 
   computePolygonNormal() {
@@ -730,12 +837,24 @@ export class Loop {
       normal.y += (curr.z - next.z) * (curr.x + next.x);
       normal.z += (curr.x - next.x) * (curr.y + next.y);
     }
-    if (normal.lengthSq() > EPSILON) {
-      normal.normalize();
-    } else {
-      normal.set(0, 0, 1);
+    return safeNormalize(normal, new THREE.Vector3(0, 0, 1));
+  }
+
+  cleanVertices(tol = 1e-5) {
+    if (this.coedges.length < 3) return;
+    const cleaned = [];
+    for (let i = 0; i < this.coedges.length; i++) {
+      const ce = this.coedges[i];
+      if (ce.startVertex && ce.endVertex && ce.startVertex.distanceTo(ce.endVertex) > tol) {
+        cleaned.push(ce);
+      }
     }
-    return normal;
+    if (cleaned.length >= 3) {
+      this.coedges = [];
+      for (const ce of cleaned) {
+        this.addCoEdge(ce);
+      }
+    }
   }
 
   reverse() {
@@ -798,18 +917,20 @@ export class Face {
   }
 
   set normal(n) {
-    this._normal = n.clone().normalize();
+    this._normal = safeNormalize(n, new THREE.Vector3(0, 0, 1));
   }
 
   computeNormal() {
     if (this.surface && this.surface.type === SURFACE_TYPES.PLANE) {
-      this._normal = this.orientation ? this.surface.normal.clone() : this.surface.normal.clone().negate();
+      const sn = this.surface.normal ? this.surface.normal.clone() : new THREE.Vector3(0, 0, 1);
+      this._normal = this.orientation ? sn : sn.negate();
     } else if (this.outerLoop) {
       const polyNormal = this.outerLoop.computePolygonNormal();
       this._normal = this.orientation ? polyNormal : polyNormal.negate();
     } else {
       this._normal = new THREE.Vector3(0, 0, 1);
     }
+    this._normal = safeNormalize(this._normal, new THREE.Vector3(0, 0, 1));
     return this._normal;
   }
 
@@ -845,41 +966,53 @@ export class Face {
     for (const hole of this.holeLoops) {
       area -= hole.computeArea(this.normal);
     }
-    return Math.max(0, area);
+    return Math.max(0, isNaN(area) ? 0 : area);
   }
 
   /**
    * Triangulate face for Three.js rendering and CSG evaluation
-   * Uses ear-clipping on outer polygon with hole bridge insertion
+   * Uses ear-clipping on outer polygon with hole bridge insertion and robust fallbacks
    */
   triangulate() {
     if (!this.outerLoop) return [];
 
-    const outerVerts = this.outerLoop.getVertices().map(v => v.point);
+    const outerRaw = this.outerLoop.getVertices().map(v => v.point);
+    const outerVerts = removeConsecutiveDuplicates(outerRaw);
     if (outerVerts.length < 3) return [];
 
-    // If planar triangle
+    const norm = safeNormalize(this.normal, new THREE.Vector3(0, 0, 1));
+
+    // If planar triangle with no holes
     if (outerVerts.length === 3 && this.holeLoops.length === 0) {
+      const edge1 = new THREE.Vector3().subVectors(outerVerts[1], outerVerts[0]);
+      const edge2 = new THREE.Vector3().subVectors(outerVerts[2], outerVerts[0]);
+      const cross = new THREE.Vector3().crossVectors(edge1, edge2);
+      if (cross.lengthSq() < 1e-12) return []; // Degenerate colinear triangle
+
       return [
         {
           a: outerVerts[0],
           b: this.orientation ? outerVerts[1] : outerVerts[2],
           c: this.orientation ? outerVerts[2] : outerVerts[1],
-          normal: this.normal.clone(),
+          normal: norm.clone(),
         },
       ];
     }
 
     // Project 3D points to 2D local plane coordinates for triangulation
-    const norm = this.normal.clone();
     let uAxis, vAxis;
-    if (this.surface && this.surface.uDir && this.surface.vDir) {
+    if (this.surface && this.surface.uDir && this.surface.vDir &&
+        this.surface.uDir.lengthSq() > 1e-8 && this.surface.vDir.lengthSq() > 1e-8) {
       uAxis = this.surface.uDir;
       vAxis = this.surface.vDir;
     } else {
       const arb = Math.abs(norm.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-      uAxis = new THREE.Vector3().crossVectors(norm, arb).normalize();
-      vAxis = new THREE.Vector3().crossVectors(norm, uAxis).normalize();
+      let cross = new THREE.Vector3().crossVectors(norm, arb);
+      if (cross.lengthSq() < 1e-8) {
+        cross = new THREE.Vector3().crossVectors(norm, new THREE.Vector3(0, 1, 0));
+      }
+      uAxis = safeNormalize(cross, new THREE.Vector3(1, 0, 0));
+      vAxis = safeNormalize(new THREE.Vector3().crossVectors(norm, uAxis), new THREE.Vector3(0, 1, 0));
     }
 
     const origin = outerVerts[0];
@@ -888,25 +1021,49 @@ export class Face {
       return new THREE.Vector2(diff.dot(uAxis), diff.dot(vAxis));
     };
 
-    // If simple convex/non-convex polygon without holes
-    if (this.holeLoops.length === 0) {
+    // Clean hole vertices
+    const validHoles = [];
+    for (const h of this.holeLoops) {
+      const hPts = removeConsecutiveDuplicates(h.getVertices().map(v => v.point));
+      if (hPts.length >= 3) {
+        validHoles.push(hPts);
+      }
+    }
+
+    // Simple polygon without holes
+    if (validHoles.length === 0) {
       const pts2d = outerVerts.map(p => project2D(p));
-      const indices = THREE.ShapeUtils.triangulateShape(pts2d, []);
+      let indices = [];
+      try {
+        indices = THREE.ShapeUtils.triangulateShape(pts2d, []);
+      } catch (e) {
+        indices = [];
+      }
+
+      // Fallback fan triangulation if ear clipping fails
+      if (!indices || indices.length === 0) {
+        indices = [];
+        for (let i = 1; i < outerVerts.length - 1; i++) {
+          indices.push([0, i, i + 1]);
+        }
+      }
+
       const triangles = [];
       for (const tri of indices) {
         let ia = tri[0];
         let ib = tri[1];
         let ic = tri[2];
 
-        // Ensure orientation matches face normal
         const va = outerVerts[ia];
         const vb = outerVerts[ib];
         const vc = outerVerts[ic];
 
-        const computedNorm = new THREE.Vector3()
-          .crossVectors(new THREE.Vector3().subVectors(vb, va), new THREE.Vector3().subVectors(vc, va))
-          .normalize();
+        const edgeAB = new THREE.Vector3().subVectors(vb, va);
+        const edgeAC = new THREE.Vector3().subVectors(vc, va);
+        const cross = new THREE.Vector3().crossVectors(edgeAB, edgeAC);
+        if (cross.lengthSq() < 1e-12) continue; // Skip degenerate triangle
 
+        const computedNorm = cross.normalize();
         if (computedNorm.dot(norm) < 0) {
           const t = ib; ib = ic; ic = t;
         }
@@ -921,17 +1078,31 @@ export class Face {
       return triangles;
     }
 
-    // Polygon with holes: combine using THREE.ShapeUtils
+    // Polygon with holes
     const outer2D = outerVerts.map(p => project2D(p));
-    const holes2D = this.holeLoops.map(h => h.getVertices().map(v => project2D(v.point)));
+    const holes2D = validHoles.map(h => h.map(p => project2D(p)));
     const allPts3D = [...outerVerts];
-    for (const h of this.holeLoops) {
-      for (const v of h.getVertices()) {
-        allPts3D.push(v.point);
+    for (const h of validHoles) {
+      for (const pt of h) {
+        allPts3D.push(pt);
       }
     }
 
-    const indices = THREE.ShapeUtils.triangulateShape(outer2D, holes2D);
+    let indices = [];
+    try {
+      indices = THREE.ShapeUtils.triangulateShape(outer2D, holes2D);
+    } catch (e) {
+      indices = [];
+    }
+
+    // Fallback: fan outer loop if triangulation with holes threw error
+    if (!indices || indices.length === 0) {
+      indices = [];
+      for (let i = 1; i < outerVerts.length - 1; i++) {
+        indices.push([0, i, i + 1]);
+      }
+    }
+
     const triangles = [];
     for (const tri of indices) {
       let ia = tri[0];
@@ -942,10 +1113,14 @@ export class Face {
       const vb = allPts3D[ib];
       const vc = allPts3D[ic];
 
-      const computedNorm = new THREE.Vector3()
-        .crossVectors(new THREE.Vector3().subVectors(vb, va), new THREE.Vector3().subVectors(vc, va))
-        .normalize();
+      if (!va || !vb || !vc) continue;
 
+      const edgeAB = new THREE.Vector3().subVectors(vb, va);
+      const edgeAC = new THREE.Vector3().subVectors(vc, va);
+      const cross = new THREE.Vector3().crossVectors(edgeAB, edgeAC);
+      if (cross.lengthSq() < 1e-12) continue;
+
+      const computedNorm = cross.normalize();
       if (computedNorm.dot(norm) < 0) {
         const t = ib; ib = ic; ic = t;
       }
@@ -1135,10 +1310,13 @@ export class Shell {
         const b = tri.b;
         const c = tri.c;
         const cross = new THREE.Vector3().crossVectors(b, c);
-        volume += a.dot(cross) / 6.0;
+        const signedTet = a.dot(cross) / 6.0;
+        if (!isNaN(signedTet) && isFinite(signedTet)) {
+          volume += signedTet;
+        }
       }
     }
-    return Math.abs(volume);
+    return isNaN(volume) || !isFinite(volume) ? 0 : Math.abs(volume);
   }
 
   /**
@@ -1147,9 +1325,12 @@ export class Shell {
   computeSurfaceArea() {
     let totalArea = 0;
     for (const face of this.faces) {
-      totalArea += face.computeArea();
+      const a = face.computeArea();
+      if (!isNaN(a) && isFinite(a)) {
+        totalArea += a;
+      }
     }
-    return totalArea;
+    return isNaN(totalArea) || !isFinite(totalArea) ? 0 : Math.max(0, totalArea);
   }
 
   /**
@@ -1158,7 +1339,9 @@ export class Shell {
   computeBoundingBox() {
     const box = new THREE.Box3();
     for (const v of this.getVertices()) {
-      box.expandByPoint(v.point);
+      if (v && v.point) {
+        box.expandByPoint(v.point);
+      }
     }
     return box;
   }
@@ -1266,7 +1449,7 @@ export class SolidBody {
     for (let i = 1; i < this.shells.length; i++) {
       vol -= this.shells[i].computeVolume();
     }
-    return Math.max(0, vol);
+    return isNaN(vol) || !isFinite(vol) ? 0 : Math.max(0, vol);
   }
 
   /**
@@ -1277,7 +1460,7 @@ export class SolidBody {
     for (const shell of this.shells) {
       area += shell.computeSurfaceArea();
     }
-    return area;
+    return isNaN(area) || !isFinite(area) ? 0 : Math.max(0, area);
   }
 
   /**
@@ -1297,6 +1480,8 @@ export class SolidBody {
           const cross = new THREE.Vector3().crossVectors(b, c);
           const tetVol = a.dot(cross) / 6.0;
 
+          if (isNaN(tetVol) || !isFinite(tetVol)) continue;
+
           const tetCentroid = new THREE.Vector3()
             .add(a).add(b).add(c)
             .multiplyScalar(0.25); // (0 + a + b + c) / 4
@@ -1307,8 +1492,9 @@ export class SolidBody {
       }
     }
 
-    if (Math.abs(totalVol) > EPSILON) {
-      return weightedCenter.divideScalar(totalVol);
+    if (Math.abs(totalVol) > EPSILON && !isNaN(totalVol) && isFinite(totalVol)) {
+      const com = weightedCenter.divideScalar(totalVol);
+      if (!isNaN(com.x) && isFinite(com.x)) return com;
     }
     return this.computeBoundingBox().getCenter(new THREE.Vector3());
   }
@@ -1328,6 +1514,7 @@ export class SolidBody {
    * Mass Properties Computation
    */
   computeMassProperties(density = 7900) {
+    const safeDensity = typeof density === 'number' && !isNaN(density) && density > 0 ? density : 7900;
     const volume = this.computeVolume(); // mm³ or m³ depending on scene
     const surfaceArea = this.computeSurfaceArea();
     const centerOfMass = this.computeCenterOfMass();
@@ -1336,7 +1523,8 @@ export class SolidBody {
     // In engineering units: assume dimensions in mm -> volume in mm³ -> density in kg/m³
     // volume_m3 = volume * 1e-9; mass_kg = volume_m3 * density
     const vol_m3 = volume * 1e-9;
-    const mass = vol_m3 * density;
+    let mass = vol_m3 * safeDensity;
+    if (isNaN(mass) || !isFinite(mass)) mass = 0;
 
     // Second moments of inertia about COM
     let Ixx = 0, Iyy = 0, Izz = 0, Ixy = 0, Ixz = 0, Iyz = 0;
@@ -1350,7 +1538,8 @@ export class SolidBody {
           const c = new THREE.Vector3().subVectors(tri.c, centerOfMass);
 
           const detJ = a.dot(new THREE.Vector3().crossVectors(b, c));
-          const densityFactor = (density * 1e-9) * detJ / 60.0;
+          if (isNaN(detJ) || !isFinite(detJ)) continue;
+          const densityFactor = (safeDensity * 1e-9) * detJ / 60.0;
 
           // Standard canonical tetrahedral moments
           const x2 = a.x * a.x + b.x * b.x + c.x * c.x + a.x * b.x + a.x * c.x + b.x * c.x;
@@ -1372,25 +1561,47 @@ export class SolidBody {
       }
     }
 
+    const sanitizeVal = (v) => (typeof v === 'number' && !isNaN(v) && isFinite(v) ? v : 0);
+
     return {
-      mass: Math.abs(mass),
-      volume: Math.abs(volume),
-      surfaceArea: Math.abs(surfaceArea),
-      centerOfMass: { x: centerOfMass.x, y: centerOfMass.y, z: centerOfMass.z },
+      mass: Math.abs(sanitizeVal(mass)),
+      volume: Math.abs(sanitizeVal(volume)),
+      surfaceArea: Math.abs(sanitizeVal(surfaceArea)),
+      centerOfMass: {
+        x: sanitizeVal(centerOfMass.x),
+        y: sanitizeVal(centerOfMass.y),
+        z: sanitizeVal(centerOfMass.z),
+      },
       boundingBox: {
-        min: { x: boundingBox.min.x, y: boundingBox.min.y, z: boundingBox.min.z },
-        max: { x: boundingBox.max.x, y: boundingBox.max.y, z: boundingBox.max.z },
+        min: { x: sanitizeVal(boundingBox.min.x), y: sanitizeVal(boundingBox.min.y), z: sanitizeVal(boundingBox.min.z) },
+        max: { x: sanitizeVal(boundingBox.max.x), y: sanitizeVal(boundingBox.max.y), z: sanitizeVal(boundingBox.max.z) },
       },
       momentsOfInertia: {
-        Ixx: Math.abs(Ixx),
-        Iyy: Math.abs(Iyy),
-        Izz: Math.abs(Izz),
-        Ixy,
-        Ixz,
-        Iyz,
+        Ixx: Math.abs(sanitizeVal(Ixx)),
+        Iyy: Math.abs(sanitizeVal(Iyy)),
+        Izz: Math.abs(sanitizeVal(Izz)),
+        Ixy: sanitizeVal(Ixy),
+        Ixz: sanitizeVal(Ixz),
+        Iyz: sanitizeVal(Iyz),
       },
-      density,
+      density: safeDensity,
     };
+  }
+
+  /**
+   * Release memory references and dispose cached geometries
+   */
+  dispose() {
+    for (const shell of this.shells) {
+      for (const face of shell.faces) {
+        face.shell = null;
+        face.outerLoop = null;
+        face.holeLoops = [];
+      }
+      shell.faces = [];
+      shell.solidBody = null;
+    }
+    this.shells = [];
   }
 
   /**
@@ -1403,8 +1614,9 @@ export class SolidBody {
     const faceGroups = [];
 
     let vertexOffset = 0;
-    for (let fIdx = 0; fIdx < this.getFaces().length; fIdx++) {
-      const face = this.getFaces()[fIdx];
+    const allFaces = this.getFaces();
+    for (let fIdx = 0; fIdx < allFaces.length; fIdx++) {
+      const face = allFaces[fIdx];
       const triangles = face.triangulate();
       const groupStart = vertexOffset;
 

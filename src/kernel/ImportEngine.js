@@ -6,8 +6,8 @@ import { SKETCH_ENTITY_TYPES } from '../utils/constants.js';
 
 export class ImportEngine {
   /**
-   * Import STL (detects ASCII or binary)
-   * @param {ArrayBuffer|string} bufferOrString
+   * Import STL (detects ASCII or binary, handles Uint8Array/Buffer/ArrayBuffer, aligned & unaligned)
+   * @param {ArrayBuffer|ArrayBufferView|string} bufferOrString
    * @returns {THREE.BufferGeometry}
    */
   importSTL(bufferOrString) {
@@ -17,32 +17,76 @@ export class ImportEngine {
       return this._importAsciiSTL(bufferOrString);
     }
 
-    // Check if binary or ASCII in ArrayBuffer
-    const isBinary = bufferOrString.byteLength > 84;
+    // Support ArrayBuffer, Uint8Array, Buffer, and any ArrayBufferView
+    let arrayBuffer;
+    let byteOffset = 0;
+    let byteLength = 0;
 
-    if (isBinary) {
+    if (ArrayBuffer.isView(bufferOrString)) {
+      arrayBuffer = bufferOrString.buffer;
+      byteOffset = bufferOrString.byteOffset;
+      byteLength = bufferOrString.byteLength;
+    } else if (bufferOrString instanceof ArrayBuffer) {
+      arrayBuffer = bufferOrString;
+      byteOffset = 0;
+      byteLength = bufferOrString.byteLength;
+    } else {
+      const decoder = new TextDecoder();
+      return this._importAsciiSTL(decoder.decode(bufferOrString));
+    }
+
+    // Binary STL check: must have at least 80 header bytes + 4 face count bytes
+    if (byteLength >= 84) {
       try {
-        return this._importBinarySTL(bufferOrString);
+        const reader = new DataView(arrayBuffer, byteOffset, byteLength);
+        const numFaces = reader.getUint32(80, true);
+        const expectedFaces = Math.floor((byteLength - 84) / 50);
+
+        // A valid binary STL file has length == 84 + numFaces * 50
+        if (numFaces === expectedFaces && (byteLength - 84) % 50 === 0) {
+          return this._importBinarySTL(arrayBuffer, byteOffset, byteLength, numFaces);
+        }
       } catch (e) {
-        const decoder = new TextDecoder();
-        return this._importAsciiSTL(decoder.decode(bufferOrString));
+        // Fall back below
       }
     }
 
-    const decoder = new TextDecoder();
-    return this._importAsciiSTL(decoder.decode(bufferOrString));
+    // Fallback: attempt decoding as ASCII STL
+    try {
+      const decoder = new TextDecoder();
+      const text = decoder.decode(new Uint8Array(arrayBuffer, byteOffset, byteLength));
+      if (text.includes('facet') || text.includes('solid')) {
+        return this._importAsciiSTL(text);
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // If it has at least 84 bytes, parse as binary with best-effort face count
+    if (byteLength >= 84) {
+      return this._importBinarySTL(arrayBuffer, byteOffset, byteLength);
+    }
+
+    // Return empty geometry
+    const emptyGeom = new THREE.BufferGeometry();
+    emptyGeom.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+    emptyGeom.setAttribute('normal', new THREE.Float32BufferAttribute([], 3));
+    emptyGeom.computeBoundingBox();
+    return emptyGeom;
   }
 
-  _importBinarySTL(buffer) {
-    const reader = new DataView(buffer);
-    const numFaces = reader.getUint32(80, true);
+  _importBinarySTL(buffer, byteOffset = 0, byteLength = buffer.byteLength, expectedFaces) {
+    const reader = new DataView(buffer, byteOffset, byteLength);
+    const declaredFaces = expectedFaces !== undefined ? expectedFaces : (byteLength >= 84 ? reader.getUint32(80, true) : 0);
+    const maxFacesPossible = byteLength >= 84 ? Math.floor((byteLength - 84) / 50) : 0;
+    const numFaces = Math.max(0, Math.min(declaredFaces, maxFacesPossible));
 
     const positions = new Float32Array(numFaces * 9);
     const normals = new Float32Array(numFaces * 9);
 
     let offset = 84;
     for (let face = 0; face < numFaces; face++) {
-      if (offset + 50 > buffer.byteLength) break;
+      if (offset + 50 > byteLength) break;
 
       const nx = reader.getFloat32(offset, true); offset += 4;
       const ny = reader.getFloat32(offset, true); offset += 4;
@@ -73,7 +117,7 @@ export class ImportEngine {
   }
 
   _importAsciiSTL(text) {
-    const lines = text.split('\n');
+    const lines = (text || '').split('\n');
     const vertices = [];
     const normals = [];
 
@@ -83,10 +127,16 @@ export class ImportEngine {
       const line = rawLine.trim();
       if (line.startsWith('facet normal')) {
         const parts = line.split(/\s+/);
-        currentNormal = [parseFloat(parts[2]), parseFloat(parts[3]), parseFloat(parts[4])];
+        const nx = parseFloat(parts[2]) || 0;
+        const ny = parseFloat(parts[3]) || 0;
+        const nz = parseFloat(parts[4]) || 0;
+        currentNormal = [nx, ny, nz];
       } else if (line.startsWith('vertex')) {
         const parts = line.split(/\s+/);
-        vertices.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
+        const vx = parseFloat(parts[1]) || 0;
+        const vy = parseFloat(parts[2]) || 0;
+        const vz = parseFloat(parts[3]) || 0;
+        vertices.push(vx, vy, vz);
         normals.push(...currentNormal);
       }
     }
@@ -94,7 +144,9 @@ export class ImportEngine {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
     geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-    geometry.computeVertexNormals();
+    if (vertices.length > 0) {
+      geometry.computeVertexNormals();
+    }
     geometry.computeBoundingBox();
     return geometry;
   }
@@ -167,9 +219,15 @@ export class ImportEngine {
    * @returns {Array} Array of sketch entities, with .meshGeometry property if 3DFACE exists
    */
   importDXF(text) {
+    if (!text || typeof text !== 'string') return [];
     const lines = text.split(/\r?\n/).map(l => l.trim());
     const entities = [];
     const meshPositions = [];
+
+    const safeNum = (v, defaultVal = 0) => {
+      const val = parseFloat(v);
+      return isNaN(val) || !isFinite(val) ? defaultVal : val;
+    };
 
     let i = 0;
     while (i < lines.length) {
@@ -182,12 +240,12 @@ export class ImportEngine {
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
-          if (c === '10') x1 = parseFloat(v);
-          else if (c === '20') y1 = parseFloat(v);
-          else if (c === '30') z1 = parseFloat(v);
-          else if (c === '11') x2 = parseFloat(v);
-          else if (c === '21') y2 = parseFloat(v);
-          else if (c === '31') z2 = parseFloat(v);
+          if (c === '10') x1 = safeNum(v);
+          else if (c === '20') y1 = safeNum(v);
+          else if (c === '30') z1 = safeNum(v);
+          else if (c === '11') x2 = safeNum(v);
+          else if (c === '21') y2 = safeNum(v);
+          else if (c === '31') z2 = safeNum(v);
           i += 2;
         }
         entities.push({
@@ -204,10 +262,10 @@ export class ImportEngine {
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
-          if (c === '10') cx = parseFloat(v);
-          else if (c === '20') cy = parseFloat(v);
-          else if (c === '30') cz = parseFloat(v);
-          else if (c === '40') r = parseFloat(v);
+          if (c === '10') cx = safeNum(v);
+          else if (c === '20') cy = safeNum(v);
+          else if (c === '30') cz = safeNum(v);
+          else if (c === '40') r = safeNum(v, 10);
           i += 2;
         }
         entities.push({
@@ -219,17 +277,17 @@ export class ImportEngine {
         });
         continue;
       } else if (code === '0' && val === 'ARC') {
-        let cx = 0, cy = 0, cz = 0, r = 10, startAngle = 0, endAngle = 360;
+        let cx = 0, cy = 0, cz = 0, r = 10, startAngle = 0, endAngle = 2 * Math.PI;
         i += 2;
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
-          if (c === '10') cx = parseFloat(v);
-          else if (c === '20') cy = parseFloat(v);
-          else if (c === '30') cz = parseFloat(v);
-          else if (c === '40') r = parseFloat(v);
-          else if (c === '50') startAngle = parseFloat(v) * Math.PI / 180;
-          else if (c === '51') endAngle = parseFloat(v) * Math.PI / 180;
+          if (c === '10') cx = safeNum(v);
+          else if (c === '20') cy = safeNum(v);
+          else if (c === '30') cz = safeNum(v);
+          else if (c === '40') r = safeNum(v, 10);
+          else if (c === '50') startAngle = (safeNum(v, 0) * Math.PI) / 180;
+          else if (c === '51') endAngle = (safeNum(v, 360) * Math.PI) / 180;
           i += 2;
         }
         entities.push({
@@ -248,18 +306,18 @@ export class ImportEngine {
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
-          if (c === '10') p1.x = parseFloat(v);
-          else if (c === '20') p1.y = parseFloat(v);
-          else if (c === '30') p1.z = parseFloat(v);
-          else if (c === '11') p2.x = parseFloat(v);
-          else if (c === '21') p2.y = parseFloat(v);
-          else if (c === '31') p2.z = parseFloat(v);
-          else if (c === '12') p3.x = parseFloat(v);
-          else if (c === '22') p3.y = parseFloat(v);
-          else if (c === '32') p3.z = parseFloat(v);
-          else if (c === '13') p4.x = parseFloat(v);
-          else if (c === '23') p4.y = parseFloat(v);
-          else if (c === '33') p4.z = parseFloat(v);
+          if (c === '10') p1.x = safeNum(v);
+          else if (c === '20') p1.y = safeNum(v);
+          else if (c === '30') p1.z = safeNum(v);
+          else if (c === '11') p2.x = safeNum(v);
+          else if (c === '21') p2.y = safeNum(v);
+          else if (c === '31') p2.z = safeNum(v);
+          else if (c === '12') p3.x = safeNum(v);
+          else if (c === '22') p3.y = safeNum(v);
+          else if (c === '32') p3.z = safeNum(v);
+          else if (c === '13') p4.x = safeNum(v);
+          else if (c === '23') p4.y = safeNum(v);
+          else if (c === '33') p4.z = safeNum(v);
           i += 2;
         }
         // Triangle 1: p1, p2, p3
@@ -275,9 +333,9 @@ export class ImportEngine {
         while (i < lines.length && lines[i] !== '0') {
           const c = lines[i];
           const v = lines[i + 1];
-          if (c === '10') px = parseFloat(v);
-          else if (c === '20') py = parseFloat(v);
-          else if (c === '30') pz = parseFloat(v);
+          if (c === '10') px = safeNum(v);
+          else if (c === '20') py = safeNum(v);
+          else if (c === '30') pz = safeNum(v);
           i += 2;
         }
         entities.push({
@@ -307,6 +365,7 @@ export class ImportEngine {
   /**
    * Import ISO 10303-21 STEP format (AP203/AP214/AP242)
    * Resolves CARTESIAN_POINT, VERTEX_POINT, POLY_LOOP, EDGE_LOOP, ADVANCED_FACE, CLOSED_SHELL, MANIFOLD_SOLID_BREP
+   * Robust to nested parentheses, string literals, multiline parameters, and comments
    * @param {string} text
    * @returns {THREE.BufferGeometry}
    */
@@ -315,27 +374,72 @@ export class ImportEngine {
       throw new Error('Invalid STEP file content');
     }
 
+    // Strip comments /* ... */
+    const cleanText = text.replace(/\/\*[\s\S]*?\*\//g, '');
+
     // Map entity ID -> { type, rawParams, tokens }
     const entities = new Map();
     const cartesianPoints = new Map();
 
-    // Regex to match #123 = ENTITY_NAME(args);
-    const entityRegex = /#(\d+)\s*=\s*([A-Za-z0-9_]+)\s*\(([\s\S]*?)\)\s*;/g;
+    // Parse entity instances with balanced parenthesis matching
+    const entityStartRegex = /#(\d+)\s*=\s*/g;
     let match;
 
-    while ((match = entityRegex.exec(text)) !== null) {
+    while ((match = entityStartRegex.exec(cleanText)) !== null) {
       const id = parseInt(match[1], 10);
-      const type = match[2].toUpperCase();
-      const raw = match[3].trim();
+      const startIndex = entityStartRegex.lastIndex;
+      let i = startIndex;
+      let parenDepth = 0;
+      let inString = false;
+      let quoteChar = '';
+      let statement = '';
+
+      while (i < cleanText.length) {
+        const ch = cleanText[i];
+        if ((ch === "'" || ch === '"') && (i === 0 || cleanText[i - 1] !== '\\')) {
+          if (!inString) {
+            inString = true;
+            quoteChar = ch;
+          } else if (ch === quoteChar) {
+            inString = false;
+          }
+        } else if (!inString) {
+          if (ch === '(') parenDepth++;
+          else if (ch === ')') parenDepth--;
+          else if (ch === ';' && parenDepth <= 0) {
+            statement = cleanText.substring(startIndex, i).trim();
+            entityStartRegex.lastIndex = i + 1;
+            break;
+          }
+        }
+        i++;
+      }
+
+      if (!statement) continue;
+
+      const openParen = statement.indexOf('(');
+      let type = '';
+      let raw = '';
+      if (statement.startsWith('(')) {
+        type = 'COMPLEX';
+        raw = statement;
+      } else if (openParen !== -1 && statement.endsWith(')')) {
+        type = statement.substring(0, openParen).trim().toUpperCase();
+        raw = statement.substring(openParen + 1, statement.length - 1).trim();
+      } else {
+        type = 'UNKNOWN';
+        raw = statement;
+      }
+
       entities.set(id, { id, type, raw });
 
       if (type === 'CARTESIAN_POINT') {
         // e.g. 'Origin point', (0., 10.5, -5.2)
         const coordMatch = raw.match(/\(\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*\)/);
         if (coordMatch) {
-          const x = parseFloat(coordMatch[1]);
-          const y = parseFloat(coordMatch[2]);
-          const z = parseFloat(coordMatch[3]);
+          const x = parseFloat(coordMatch[1]) || 0;
+          const y = parseFloat(coordMatch[2]) || 0;
+          const z = parseFloat(coordMatch[3]) || 0;
           cartesianPoints.set(id, [x, y, z]);
         }
       }
@@ -426,7 +530,9 @@ export class ImportEngine {
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.computeVertexNormals();
+    if (positions.length > 0) {
+      geometry.computeVertexNormals();
+    }
     geometry.computeBoundingBox();
     return geometry;
   }
@@ -436,6 +542,7 @@ export class ImportEngine {
    * Parses S, G, D, P sections and resolves entities:
    * 186 (MSBO), 514 (Shell), 510 (Face), 508 (Loop), 504 (Edge), 502 (Vertex List),
    * 128 (Rational B-Spline Surface), 106 (Copious Data), 110 (Line), 108 (Plane)
+   * Robust against stripped trailing spaces and padded records
    * @param {string} text
    * @returns {THREE.BufferGeometry}
    */
@@ -444,13 +551,14 @@ export class ImportEngine {
       throw new Error('Invalid IGES file content');
     }
 
-    const rawLines = text.split(/\r?\n/);
+    const rawLines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
     const dLines = [];
     const pLines = [];
 
-    // Separate records by 73rd column section flag
-    for (const line of rawLines) {
-      if (line.length < 73) continue;
+    // Separate records by 73rd column section flag (ensuring 80-char padding)
+    for (const rawLine of rawLines) {
+      if (!rawLine || rawLine.length === 0) continue;
+      const line = rawLine.padEnd(80, ' ');
       const section = line.charAt(72);
       if (section === 'D') {
         dLines.push(line);
@@ -463,20 +571,22 @@ export class ImportEngine {
     // Each DE entity consists of two consecutive 80-char D lines
     const directoryEntries = new Map();
     for (let i = 0; i < dLines.length; i += 2) {
-      const line1 = dLines[i];
-      const line2 = dLines[i + 1] || '';
+      const line1 = dLines[i].padEnd(80, ' ');
+      const line2 = (dLines[i + 1] || '').padEnd(80, ' ');
       const deIndex = i + 1; // 1-based index (1, 3, 5...)
 
       const type = parseInt(line1.substring(0, 8).trim(), 10);
       const paramStart = parseInt(line1.substring(8, 16).trim(), 10);
       const form = parseInt(line2.substring(32, 40).trim(), 10) || 0;
 
-      directoryEntries.set(deIndex, {
-        deIndex,
-        type,
-        paramStart,
-        form,
-      });
+      if (!isNaN(type)) {
+        directoryEntries.set(deIndex, {
+          deIndex,
+          type,
+          paramStart,
+          form,
+        });
+      }
     }
 
     // 2. Parse Parameter Data (P) lines
@@ -484,8 +594,9 @@ export class ImportEngine {
     const paramStringsByDE = new Map();
 
     for (const pLine of pLines) {
-      const paramChunk = pLine.substring(0, 64);
-      const dePointerStr = pLine.substring(64, 72).trim();
+      const padded = pLine.padEnd(80, ' ');
+      const paramChunk = padded.substring(0, 64);
+      const dePointerStr = padded.substring(64, 72).trim();
       const dePointer = parseInt(dePointerStr, 10);
 
       if (!isNaN(dePointer)) {

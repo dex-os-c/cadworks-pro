@@ -13,7 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 
-import { constraintSolver } from '../src/kernel/ConstraintSolver.js';
+import { constraintSolver, ConstraintSolver, QRDecomposition } from '../src/kernel/ConstraintSolver.js';
 import { featureEngine } from '../src/features/FeatureEngine.js';
 import { geometryEngine } from '../src/kernel/GeometryEngine.js';
 import {
@@ -24,6 +24,9 @@ import {
   Face,
   Shell,
   SolidBody,
+  safeNormalize,
+  sanitizePoint,
+  removeConsecutiveDuplicates,
 } from '../src/kernel/Topology.js';
 import {
   createSolidBox,
@@ -41,7 +44,7 @@ import {
   solidToBufferGeometry,
   bufferGeometryToSolid,
 } from '../src/kernel/BRep.js';
-import { AssemblyManager, AssemblyComponent } from '../src/assembly/AssemblyManager.js';
+import { AssemblyManager, AssemblyComponent, safeQuaternionFromVectors } from '../src/assembly/AssemblyManager.js';
 import { exportEngine } from '../src/kernel/ExportEngine.js';
 import { importEngine } from '../src/kernel/ImportEngine.js';
 import { feaEngine, ELEMENT_TYPES } from '../src/simulation/FEAEngine.js';
@@ -738,3 +741,196 @@ test('DrawingEngine: standard sheet generation with dimensions, GD&T, and SVG/DX
   assert.ok(dxf.includes('VISIBLE'), 'DXF must contain VISIBLE layer lines');
   assert.ok(dxf.includes('DIMENSION'), 'DXF must contain DIMENSION entities');
 });
+
+// ============================================================================
+// 9. DEEP AUDIT: 2D CONSTRAINT SOLVER & ASSEMBLY ENGINE ROBUSTNESS
+// ============================================================================
+
+test('ConstraintSolver Audit: QR decomposition numerical instability, machine epsilon handling & empty matrix robustness', () => {
+  // 1. Empty matrix handling
+  const qrEmpty = new QRDecomposition([]);
+  assert.equal(qrEmpty.rank, 0, 'Empty matrix QR must report rank 0');
+  const solEmpty = qrEmpty.solve([]);
+  assert.equal(solEmpty.length, 0, 'Solve on empty matrix must return empty array');
+
+  // 2. All-zero matrix handling
+  const qrZero = new QRDecomposition([[0, 0, 0], [0, 0, 0]]);
+  assert.equal(qrZero.rank, 0, 'Zero matrix QR must report rank 0');
+  const solZero = qrZero.solve([1, 2]);
+  assert.deepEqual(Array.from(solZero), [0, 0, 0], 'Solve on zero matrix must return all zeros');
+
+  // 3. Rank-1 matrix with machine epsilon perturbations (~2e-16)
+  const A = [
+    [1.0, 2.0, 3.0],
+    [2.0, 4.0, 6.0],
+    [3.0, 6.0, 9.0 + Number.EPSILON * 2],
+  ];
+  const qrPerturbed = new QRDecomposition(A);
+  assert.equal(qrPerturbed.rank, 1, `Rank of rank-1 matrix with eps perturbation must be 1, got ${qrPerturbed.rank}`);
+
+  // 4. Over-determined system with column pivoting and back-substitution
+  const A_rect = [
+    [1, 0],
+    [0, 1],
+    [1, 1],
+  ];
+  const qrRect = new QRDecomposition(A_rect);
+  assert.equal(qrRect.rank, 2, 'Full column rank rectangular matrix must have rank 2');
+  const solRect = qrRect.solve([1, 2, 3]);
+  assert.ok(Math.abs(solRect[0] - 1) < 1e-6 && Math.abs(solRect[1] - 2) < 1e-6, 'Rectangular least-squares solve must be exact');
+});
+
+test('ConstraintSolver Audit: Degenerate geometries (zero-length lines, coincident points dx=0 dy=0) & LM damping', () => {
+  const solver = new ConstraintSolver();
+
+  // 1. Zero-length line in parallel constraint (dx=0, dy=0)
+  const degenEntities = [
+    { id: 'dl1', p1: { x: 5, y: 5 }, p2: { x: 5, y: 5 } }, // zero length!
+    { id: 'dl2', p1: { x: 10, y: 0 }, p2: { x: 20, y: 0 } },
+  ];
+  const parallelConstraints = [
+    { id: 'dc1', type: CONSTRAINT_TYPES.PARALLEL, entity1Id: 'dl1', entity2Id: 'dl2' },
+  ];
+  const parRes = solver.solve(degenEntities, parallelConstraints);
+  assert.equal(parRes.converged, true, 'Zero-length parallel constraint must not explode');
+  assert.ok(!isNaN(parRes.error), 'Residual must not be NaN');
+  assert.ok(parRes.error < 1e-3, 'Residual must be near 0');
+
+  // 2. Zero-length line in angle constraint (dx=0, dy=0)
+  const angleConstraints = [
+    { id: 'dc2', type: CONSTRAINT_TYPES.ANGLE, entity1Id: 'dl1', entity2Id: 'dl2', angle: 45 },
+  ];
+  const angRes = solver.solve(degenEntities, angleConstraints);
+  assert.ok(!isNaN(angRes.error), 'Angle residual on degenerate line must not produce NaN');
+  assert.ok(Number.isFinite(angRes.error), 'Angle residual must be finite');
+
+  // 3. System starting from fully collapsed line (p1 == p2 == (0,0)) coupling with dimension and fix
+  const expandingEntities = [
+    { id: 'el1', p1: { x: 0, y: 0 }, p2: { x: 0, y: 0 } }, // collapsed point
+    { id: 'el2', p1: { x: 0, y: 0 }, p2: { x: 20, y: 0 } },
+  ];
+  const expandConstraints = [
+    { id: 'ec1', type: CONSTRAINT_TYPES.FIX, entity1Id: 'el1', point1: 'p1', x: 0, y: 0 },
+    { id: 'ec2', type: CONSTRAINT_TYPES.DIMENSION, entity1Id: 'el1', value: 15 },
+    { id: 'ec3', type: CONSTRAINT_TYPES.HORIZONTAL, entity1Id: 'el1' },
+    { id: 'ec4', type: CONSTRAINT_TYPES.COINCIDENT, entity1Id: 'el1', entity2Id: 'el2', point1: 'p2', point2: 'p1' },
+  ];
+  const expandRes = solver.solve(expandingEntities, expandConstraints);
+  assert.equal(expandRes.converged, true, 'Solver must expand collapsed line segment and converge');
+  assert.ok(expandRes.error < 1e-3, `Error ${expandRes.error} must be < 1e-3`);
+  const solvedL1 = expandingEntities.find(e => e.id === 'el1');
+  assert.ok(Math.abs(solvedL1.p2.x - 15) < 1e-3, 'Collapsed line must expand to length 15');
+});
+
+test('AssemblyManager Audit: Quaternion degeneracy for 180° anti-parallel and colinear vectors', () => {
+  // 1. safeQuaternionFromVectors unit tests
+  const qIdent = safeQuaternionFromVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 1, 0));
+  assert.ok(Math.abs(qIdent.w - 1) < 1e-6, 'Identical vectors must return identity quaternion');
+
+  const qOppositeY = safeQuaternionFromVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, -1, 0));
+  assert.ok(!isNaN(qOppositeY.x) && !isNaN(qOppositeY.w), 'Opposite Y vectors must not produce NaN');
+  const testVecY = new THREE.Vector3(0, 1, 0).applyQuaternion(qOppositeY);
+  assert.ok(testVecY.dot(new THREE.Vector3(0, -1, 0)) > 0.999, 'Opposite Y vectors must rotate by 180°');
+
+  const qOppositeX = safeQuaternionFromVectors(new THREE.Vector3(1, 0, 0), new THREE.Vector3(-1, 0, 0));
+  const testVecX = new THREE.Vector3(1, 0, 0).applyQuaternion(qOppositeX);
+  assert.ok(testVecX.dot(new THREE.Vector3(-1, 0, 0)) > 0.999, 'Opposite X vectors must rotate by 180°');
+
+  const qZero = safeQuaternionFromVectors(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 1, 0));
+  assert.ok(Math.abs(qZero.w - 1) < 1e-6, 'Degenerate zero-length vector must return identity quaternion');
+
+  // 2. Coincident mate starting 180° opposite
+  const mgr = new AssemblyManager();
+  const base = mgr.insertComponent('Base', new THREE.BoxGeometry(30, 30, 30), true);
+  const comp = mgr.insertComponent('Comp', new THREE.BoxGeometry(30, 30, 30), false);
+
+  // Invert comp upside-down (180 deg) so bottom faces in opposite direction
+  comp.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+  comp.updateMatrix();
+
+  mgr.addMate(MATE_TYPES.COINCIDENT, base.id, 'top', comp.id, 'bottom', 0);
+  const coinRes = mgr.solve();
+  assert.equal(coinRes.converged, true, 'Coincident mate must resolve 180° opposite face orientation');
+  assert.ok(!isNaN(comp.quaternion.x) && !isNaN(comp.quaternion.w), 'Comp quaternion must not be NaN');
+
+  // 3. Concentric mate with 180° anti-parallel cylinder axes
+  const mgrConc = new AssemblyManager();
+  const c1 = mgrConc.insertComponent('C1', new THREE.CylinderGeometry(10, 10, 50), true);
+  const c2 = mgrConc.insertComponent('C2', new THREE.CylinderGeometry(10, 10, 50), false);
+  c2.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI); // anti-parallel axis
+  c2.position.set(25, 25, 0);
+  c2.updateMatrix();
+
+  mgrConc.addMate(MATE_TYPES.CONCENTRIC, c1.id, 'cylinder', c2.id, 'cylinder', 0);
+  const concRes = mgrConc.solve();
+  assert.equal(concRes.converged, true, 'Concentric mate must resolve anti-parallel cylinder axes');
+  assert.ok(Math.abs(c2.position.x) < 1e-3 && Math.abs(c2.position.y) < 1e-3, 'Concentric axes must align');
+
+  // 4. Perpendicular mate starting from colinear face normals
+  const mgrPerp = new AssemblyManager();
+  const b1 = mgrPerp.insertComponent('B1', new THREE.BoxGeometry(20, 20, 20), true);
+  const b2 = mgrPerp.insertComponent('B2', new THREE.BoxGeometry(20, 20, 20), false);
+  mgrPerp.addMate(MATE_TYPES.PERPENDICULAR, b1.id, 'top', b2.id, 'top', 0);
+  const perpRes = mgrPerp.solve();
+  assert.equal(perpRes.converged, true, 'Perpendicular mate must resolve colinear starting normals');
+  const dotNormals = b1.getFaceReference('top').normal.dot(b2.getFaceReference('top').normal);
+  assert.ok(Math.abs(dotNormals) < 1e-3, `Normals must be perpendicular, dot=${dotNormals}`);
+});
+
+test('AssemblyManager Audit: Null checks for deleted/missing components, faces & removeComponent', () => {
+  const mgr = new AssemblyManager();
+  const c1 = mgr.insertComponent('Comp1', new THREE.BoxGeometry(20, 20, 20), true);
+  const c2 = mgr.insertComponent('Comp2', new THREE.BoxGeometry(20, 20, 20), false);
+
+  // Add mate with deleted component ID
+  mgr.addMate(MATE_TYPES.COINCIDENT, c1.id, 'top', 'deleted_comp_id_999', 'bottom', 0);
+  const resMissing = mgr.solve();
+  assert.ok(resMissing.converged, 'Solve must gracefully handle mate referencing non-existent component');
+
+  // Add valid mate between c1 and c2
+  const validMate = mgr.addMate(MATE_TYPES.COINCIDENT, c1.id, 'top', c2.id, 'bottom', 5.0);
+  assert.equal(mgr.mates.length, 2, 'Must have 2 mates');
+
+  // removeComponent should remove component and cleanup dangling mates
+  mgr.removeComponent(c2.id);
+  assert.equal(mgr.components.length, 1, 'Component count must be 1 after removal');
+  assert.equal(mgr.mates.length, 1, 'Dangling mate referencing removed component must be pruned');
+
+  // Custom face reference with degenerate/missing normal
+  const degenFace = c1.getFaceReference({ point: new THREE.Vector3(0, 0, 0), normal: new THREE.Vector3(0, 0, 0) });
+  assert.ok(Math.abs(degenFace.normal.length() - 1.0) < 1e-6, 'Degenerate normal must fallback to normalized unit vector');
+});
+
+test('AssemblyManager Audit: Exploded view handling for 0 and 1 components without division by zero', () => {
+  const mgr = new AssemblyManager();
+
+  // 1. 0 components in assembly
+  const exp0 = mgr.createExplodedView(50);
+  assert.equal(exp0.components.length, 0, 'Exploded view on 0 components must return empty array');
+  assert.equal(exp0.leaderLines.length, 0, 'Exploded view on 0 components must have 0 leader lines');
+  assert.equal(exp0.distance, 50, 'Configured distance must be preserved');
+
+  // 2. 1 component in assembly
+  const c1 = mgr.insertComponent('SoloBody', new THREE.BoxGeometry(20, 20, 20), false);
+  c1.position.set(10, 20, 30);
+  c1.updateMatrix();
+
+  const exp1 = mgr.createExplodedView(50);
+  assert.equal(exp1.components.length, 1, 'Exploded view on 1 component must return 1 component');
+  assert.equal(exp1.components[0].distance, 0, 'Single component must not explode (distance = 0)');
+  assert.ok(
+    exp1.components[0].position.distanceTo(new THREE.Vector3(10, 20, 30)) < 1e-6,
+    'Single component must remain at its original position'
+  );
+  assert.equal(exp1.leaderLines.length, 0, 'Single component must have 0 leader lines');
+
+  // 3. Multi-component assembly explodes properly
+  const c2 = mgr.insertComponent('MateBody', new THREE.BoxGeometry(20, 20, 20), false);
+  c2.position.set(10, 50, 30);
+  c2.updateMatrix();
+
+  const exp2 = mgr.createExplodedView(40);
+  assert.equal(exp2.components.length, 2, 'Multi-component exploded view must include both components');
+  assert.ok(exp2.leaderLines.length > 0, 'Multi-component exploded view must generate leader lines');
+});
+

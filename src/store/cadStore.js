@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { generateId } from '../utils/math.js';
 import { TOOLS, APP_MODES, DEFAULT_SETTINGS, FEATURE_TYPES, MATERIALS, MATE_TYPES } from '../utils/constants.js';
 import { assemblyManager } from '../assembly/AssemblyManager.js';
+import { safeDeepClone } from '../utils/clone.js';
 
 const MAX_UNDO_HISTORY = 40;
 
@@ -106,15 +107,15 @@ export const useCADStore = create(
   immer((set, get) => ({
     ...initialState,
 
-    // Helper to capture state snapshot for undo
+    // Helper to capture state snapshot for undo (deeply clones without circular references or leaking Three.js prototypes)
     _captureUndoSnapshot: (state, actionName = 'Action') => {
       state.undoStack.push({
         actionName,
         snapshot: {
-          features: JSON.parse(JSON.stringify(state.features)),
-          sketchEntities: JSON.parse(JSON.stringify(state.sketchEntities)),
-          sketchConstraints: JSON.parse(JSON.stringify(state.sketchConstraints)),
-          sketchDimensions: JSON.parse(JSON.stringify(state.sketchDimensions)),
+          features: safeDeepClone(state.features),
+          sketchEntities: safeDeepClone(state.sketchEntities),
+          sketchConstraints: safeDeepClone(state.sketchConstraints),
+          sketchDimensions: safeDeepClone(state.sketchDimensions),
           rollbackIndex: state.rollbackIndex,
           activeMaterial: state.activeMaterial,
         },
@@ -485,10 +486,10 @@ export const useCADStore = create(
       if (state.undoStack.length === 0) return;
 
       const currentSnapshot = {
-        features: JSON.parse(JSON.stringify(state.features)),
-        sketchEntities: JSON.parse(JSON.stringify(state.sketchEntities)),
-        sketchConstraints: JSON.parse(JSON.stringify(state.sketchConstraints)),
-        sketchDimensions: JSON.parse(JSON.stringify(state.sketchDimensions)),
+        features: safeDeepClone(state.features),
+        sketchEntities: safeDeepClone(state.sketchEntities),
+        sketchConstraints: safeDeepClone(state.sketchConstraints),
+        sketchDimensions: safeDeepClone(state.sketchDimensions),
         rollbackIndex: state.rollbackIndex,
         activeMaterial: state.activeMaterial,
       };
@@ -496,12 +497,12 @@ export const useCADStore = create(
 
       const prev = state.undoStack.pop();
       const s = prev.snapshot;
-      state.features = s.features;
-      state.sketchEntities = s.sketchEntities;
-      state.sketchConstraints = s.sketchConstraints;
-      state.sketchDimensions = s.sketchDimensions;
-      state.rollbackIndex = s.rollbackIndex;
-      state.activeMaterial = s.activeMaterial;
+      state.features = s.features || [];
+      state.sketchEntities = s.sketchEntities || {};
+      state.sketchConstraints = s.sketchConstraints || {};
+      state.sketchDimensions = s.sketchDimensions || {};
+      state.rollbackIndex = s.rollbackIndex ?? -1;
+      state.activeMaterial = s.activeMaterial || 'Steel_1020';
 
       state.needsRebuild = true;
       state.statusMessage = `Undo: ${prev.actionName || 'Action'}`;
@@ -511,10 +512,10 @@ export const useCADStore = create(
       if (state.redoStack.length === 0) return;
 
       const currentSnapshot = {
-        features: JSON.parse(JSON.stringify(state.features)),
-        sketchEntities: JSON.parse(JSON.stringify(state.sketchEntities)),
-        sketchConstraints: JSON.parse(JSON.stringify(state.sketchConstraints)),
-        sketchDimensions: JSON.parse(JSON.stringify(state.sketchDimensions)),
+        features: safeDeepClone(state.features),
+        sketchEntities: safeDeepClone(state.sketchEntities),
+        sketchConstraints: safeDeepClone(state.sketchConstraints),
+        sketchDimensions: safeDeepClone(state.sketchDimensions),
         rollbackIndex: state.rollbackIndex,
         activeMaterial: state.activeMaterial,
       };
@@ -522,12 +523,12 @@ export const useCADStore = create(
 
       const next = state.redoStack.pop();
       const s = next.snapshot;
-      state.features = s.features;
-      state.sketchEntities = s.sketchEntities;
-      state.sketchConstraints = s.sketchConstraints;
-      state.sketchDimensions = s.sketchDimensions;
-      state.rollbackIndex = s.rollbackIndex;
-      state.activeMaterial = s.activeMaterial;
+      state.features = s.features || [];
+      state.sketchEntities = s.sketchEntities || {};
+      state.sketchConstraints = s.sketchConstraints || {};
+      state.sketchDimensions = s.sketchDimensions || {};
+      state.rollbackIndex = s.rollbackIndex ?? -1;
+      state.activeMaterial = s.activeMaterial || 'Steel_1020';
 
       state.needsRebuild = true;
       state.statusMessage = 'Redo';

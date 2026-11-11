@@ -84,22 +84,33 @@ function CADBodyMesh({ body, isSelected, onSelect, shadedMode, wireframeMode, ed
   const meshRef = useRef();
 
   const material = useMemo(() => {
-    const base = materialLibrary.getThreeMaterial(materialKey || 'Steel_1020', wireframeMode);
-    const mat = base.clone();
-    if (isSelected) {
-      mat.emissive = new THREE.Color('#004488');
-      mat.emissiveIntensity = 0.5;
+    if (!body || !body.geometry) return null;
+    try {
+      const base = materialLibrary.getThreeMaterial(materialKey || 'Steel_1020', wireframeMode);
+      const mat = base ? base.clone() : new THREE.MeshStandardMaterial({ color: '#cccccc' });
+      if (isSelected) {
+        mat.emissive = new THREE.Color('#004488');
+        mat.emissiveIntensity = 0.5;
+      }
+      return mat;
+    } catch (e) {
+      return new THREE.MeshStandardMaterial({ color: '#cccccc' });
     }
-    return mat;
-  }, [materialKey, wireframeMode, isSelected]);
+  }, [body, materialKey, wireframeMode, isSelected]);
 
-  // Generate edge geometry
+  // Generate edge geometry defensively
   const edgesGeometry = useMemo(() => {
-    if (!body.geometry) return null;
-    return new THREE.EdgesGeometry(body.geometry, 25);
-  }, [body.geometry]);
+    if (!body || !body.geometry) return null;
+    try {
+      const pos = body.geometry.getAttribute ? body.geometry.getAttribute('position') : body.geometry.attributes?.position;
+      if (!pos || pos.count < 3) return null;
+      return new THREE.EdgesGeometry(body.geometry, 25);
+    } catch (e) {
+      return null;
+    }
+  }, [body?.geometry]);
 
-  if (!body.geometry) return null;
+  if (!body || !body.geometry || !material) return null;
 
   return (
     <group>
@@ -109,7 +120,7 @@ function CADBodyMesh({ body, isSelected, onSelect, shadedMode, wireframeMode, ed
         material={material}
         onClick={(e) => {
           e.stopPropagation();
-          onSelect(body);
+          if (body && onSelect) onSelect(body);
         }}
         castShadow
         receiveShadow
@@ -208,6 +219,7 @@ function ActiveSketchOverlay({ activeSketchId, activeSketchPlane, sketchEntities
 
 /**
  * Viewport Interaction Handler (Desktop & Mobile Touch)
+ * Prevents two-finger pinch/pan from conflicting with single-touch rotate or falsely placing sketch entities
  */
 function ViewportController({ onPointerMoveInSketch, onSketchClick }) {
   const { camera, gl } = useThree();
@@ -218,6 +230,9 @@ function ViewportController({ onPointerMoveInSketch, onSketchClick }) {
 
   useEffect(() => {
     const dom = gl.domElement;
+    const activePointers = new Set();
+    let isMultiTouch = false;
+    let lastMultiTouchTime = 0;
 
     const getCoords = (e) => {
       const clientX = e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : (e.changedTouches && e.changedTouches[0] ? e.changedTouches[0].clientX : 0));
@@ -225,7 +240,18 @@ function ViewportController({ onPointerMoveInSketch, onSketchClick }) {
       return { clientX, clientY };
     };
 
+    const handlePointerDown = (e) => {
+      activePointers.add(e.pointerId);
+      if (activePointers.size >= 2) {
+        isMultiTouch = true;
+        lastMultiTouchTime = Date.now();
+      }
+    };
+
     const handlePointerMove = (e) => {
+      // If user is currently doing a two-finger pinch/pan, don't update sketch hover preview
+      if (isMultiTouch || activePointers.size >= 2) return;
+
       const { clientX, clientY } = getCoords(e);
       const rect = dom.getBoundingClientRect();
       const px = ((clientX - rect.left) / rect.width) * 2 - 1;
@@ -240,8 +266,19 @@ function ViewportController({ onPointerMoveInSketch, onSketchClick }) {
       }
     };
 
-    const handleClick = (e) => {
-      if (!isSketchActive) return;
+    const handlePointerUp = (e) => {
+      activePointers.delete(e.pointerId);
+
+      const wasPinchPan = isMultiTouch || (Date.now() - lastMultiTouchTime < 400);
+      if (activePointers.size === 0) {
+        isMultiTouch = false;
+      }
+
+      // If this pointerup was the release of a two-finger pinch/pan gesture, do NOT trigger sketch click!
+      if (wasPinchPan || !isSketchActive) {
+        return;
+      }
+
       const { clientX, clientY } = getCoords(e);
       const rect = dom.getBoundingClientRect();
       const px = ((clientX - rect.left) / rect.width) * 2 - 1;
@@ -254,12 +291,23 @@ function ViewportController({ onPointerMoveInSketch, onSketchClick }) {
       }
     };
 
+    const handlePointerCancel = (e) => {
+      activePointers.delete(e.pointerId);
+      if (activePointers.size === 0) {
+        isMultiTouch = false;
+      }
+    };
+
+    dom.addEventListener('pointerdown', handlePointerDown);
     dom.addEventListener('pointermove', handlePointerMove);
-    dom.addEventListener('pointerup', handleClick);
+    dom.addEventListener('pointerup', handlePointerUp);
+    dom.addEventListener('pointercancel', handlePointerCancel);
 
     return () => {
+      dom.removeEventListener('pointerdown', handlePointerDown);
       dom.removeEventListener('pointermove', handlePointerMove);
-      dom.removeEventListener('pointerup', handleClick);
+      dom.removeEventListener('pointerup', handlePointerUp);
+      dom.removeEventListener('pointercancel', handlePointerCancel);
     };
   }, [camera, gl, isSketchActive, activeSketchPlane, snapEnabled, onPointerMoveInSketch, onSketchClick]);
 

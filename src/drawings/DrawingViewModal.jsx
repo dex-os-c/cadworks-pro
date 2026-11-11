@@ -1,5 +1,5 @@
 // CADWorks Pro - 2D Engineering Drawing Sheet Viewer & Vector Exporter Modal
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { X, Download, Eye, Layers, Settings2, FileText, Check } from 'lucide-react';
 import { drawingEngine, SHEET_SIZES } from './DrawingEngine.js';
 import { useCADStore } from '../store/cadStore.js';
@@ -15,50 +15,108 @@ export default function DrawingViewModal({ isOpen, onClose }) {
   const [showGDT, setShowGDT] = useState(true);
   const [downloadSuccess, setDownloadSuccess] = useState(null);
 
+  const downloadTimerRef = useRef(null);
+  const revokeTimerRef = useRef(null);
+
+  // Clean up any pending timers on unmount to prevent React state leaks
+  useEffect(() => {
+    return () => {
+      if (downloadTimerRef.current) clearTimeout(downloadTimerRef.current);
+      if (revokeTimerRef.current) clearTimeout(revokeTimerRef.current);
+    };
+  }, []);
+
+  // Keyboard accessibility: Escape closes modal
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') onClose?.();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onClose]);
+
   // Compute 2D drawing sheet data whenever geometry or options change
   const sheetData = useMemo(() => {
-    if (!isOpen || bodies.length === 0 || !bodies[0].geometry) return null;
+    if (!isOpen || bodies.length === 0 || !bodies[0]?.geometry) return null;
 
-    const sheetSize = SHEET_SIZES[sheetSizeKey] || SHEET_SIZES.A4_LANDSCAPE;
-    const data = drawingEngine.createStandardSheet(bodies[0].geometry, {
-      sheetSize,
-      enableHLR,
-      title: documentName.toUpperCase(),
-      partNumber: 'DWG-' + (documentName.slice(0, 4).toUpperCase() || 'PART'),
-      material: activeMaterial,
-    });
-
-    return data;
+    try {
+      const sheetSize = SHEET_SIZES[sheetSizeKey] || SHEET_SIZES.A4_LANDSCAPE;
+      const data = drawingEngine.createStandardSheet(bodies[0].geometry, {
+        sheetSize,
+        enableHLR,
+        title: documentName.toUpperCase(),
+        partNumber: 'DWG-' + (documentName.slice(0, 4).toUpperCase() || 'PART'),
+        material: activeMaterial,
+      });
+      return data;
+    } catch (err) {
+      console.error('Failed to generate drawing sheet:', err);
+      return null;
+    }
   }, [isOpen, bodies, documentName, activeMaterial, enableHLR, sheetSizeKey]);
 
   if (!isOpen) return null;
 
   const handleExportSVG = () => {
     if (!sheetData) return;
-    const svgStr = drawingEngine.exportSVG(sheetData);
-    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${documentName.replace(/\s+/g, '_')}_drawing.svg`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setDownloadSuccess('SVG Exported');
-    setTimeout(() => setDownloadSuccess(null), 2500);
+    try {
+      const svgStr = drawingEngine.exportSVG({
+        ...sheetData,
+        dimensions: showDimensions ? sheetData.dimensions : [],
+        gdtFrames: showGDT ? sheetData.gdtFrames : [],
+      });
+      const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${documentName.replace(/\s+/g, '_')}_drawing.svg`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      revokeTimerRef.current = setTimeout(() => {
+        try { URL.revokeObjectURL(url); } catch (_) {}
+      }, 1000);
+
+      setDownloadSuccess('SVG Exported');
+      if (downloadTimerRef.current) clearTimeout(downloadTimerRef.current);
+      downloadTimerRef.current = setTimeout(() => {
+        setDownloadSuccess(null);
+      }, 2500);
+    } catch (err) {
+      console.error('Failed to export SVG drawing:', err);
+    }
   };
 
   const handleExportDXF = () => {
     if (!sheetData) return;
-    const dxfStr = drawingEngine.exportDXF(sheetData);
-    const blob = new Blob([dxfStr], { type: 'application/dxf;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${documentName.replace(/\s+/g, '_')}_drawing.dxf`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setDownloadSuccess('DXF Exported');
-    setTimeout(() => setDownloadSuccess(null), 2500);
+    try {
+      const dxfStr = drawingEngine.exportDXF({
+        ...sheetData,
+        dimensions: showDimensions ? sheetData.dimensions : [],
+      });
+      const blob = new Blob([dxfStr], { type: 'application/dxf;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${documentName.replace(/\s+/g, '_')}_drawing.dxf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      revokeTimerRef.current = setTimeout(() => {
+        try { URL.revokeObjectURL(url); } catch (_) {}
+      }, 1000);
+
+      setDownloadSuccess('DXF Exported');
+      if (downloadTimerRef.current) clearTimeout(downloadTimerRef.current);
+      downloadTimerRef.current = setTimeout(() => {
+        setDownloadSuccess(null);
+      }, 2500);
+    } catch (err) {
+      console.error('Failed to export DXF drawing:', err);
+    }
   };
 
   return (

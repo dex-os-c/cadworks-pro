@@ -33,7 +33,7 @@ export class SparseMatrix {
   }
 
   add(i, j, value) {
-    if (Math.abs(value) < 1e-25) return;
+    if (!Number.isFinite(value) || Math.abs(value) < 1e-25) return;
     const row = this.rows[i];
     row.set(j, (row.get(j) || 0) + value);
   }
@@ -47,9 +47,9 @@ export class SparseMatrix {
     for (let i = 0; i < n; i++) {
       let sum = 0;
       for (const [j, v] of this.rows[i]) {
-        sum += v * x[j];
+        sum += v * (x[j] || 0);
       }
-      out[i] = sum;
+      out[i] = Number.isFinite(sum) ? sum : 0;
     }
     return out;
   }
@@ -97,13 +97,16 @@ export class FEAEngine {
     if (!geometry) return null;
 
     geometry.computeBoundingBox();
-    const box = geometry.boundingBox;
+    const box = geometry.boundingBox || new THREE.Box3(new THREE.Vector3(-10, -10, -10), new THREE.Vector3(10, 10, 10));
     const min = box.min;
     const max = box.max;
 
-    const sizeX = Math.max(1e-3, max.x - min.x);
-    const sizeY = Math.max(1e-3, max.y - min.y);
-    const sizeZ = Math.max(1e-3, max.z - min.z);
+    const rawSizeX = max.x - min.x;
+    const rawSizeY = max.y - min.y;
+    const rawSizeZ = max.z - min.z;
+    const sizeX = (Number.isFinite(rawSizeX) && rawSizeX > 1e-4) ? rawSizeX : 10;
+    const sizeY = (Number.isFinite(rawSizeY) && rawSizeY > 1e-4) ? rawSizeY : 10;
+    const sizeZ = (Number.isFinite(rawSizeZ) && rawSizeZ > 1e-4) ? rawSizeZ : 10;
 
     // Determine voxel resolution based on dimensions or options
     let nx = options.nx || 4;
@@ -219,14 +222,17 @@ export class FEAEngine {
             let [n0, n1, n2, n3] = tetNodes;
             const pts = [nodes[n0].posMeters, nodes[n1].posMeters, nodes[n2].posMeters, nodes[n3].posMeters];
             let V = this._computeTetVolume(pts);
-            if (V < 0) {
+
+            // Inverted tet: repair by swapping vertices 1 and 2
+            if (V < -1e-15) {
               const tmp = n1;
               n1 = n2;
               n2 = tmp;
               V = -V;
             }
 
-            if (V > 1e-15) {
+            // Degenerate tet (V <= 1e-15 or non-finite): skip so stiffness matrix never gets NaNs
+            if (V > 1e-15 && Number.isFinite(V)) {
               elements.push({
                 id: elements.length,
                 type: ELEMENT_TYPES.TET4,
@@ -259,8 +265,10 @@ export class FEAEngine {
       for (const t of fallbackTets) {
         let [n0, n1, n2, n3] = t;
         let V = this._computeTetVolume([nodes[n0].posMeters, nodes[n1].posMeters, nodes[n2].posMeters, nodes[n3].posMeters]);
-        if (V < 0) { const tmp = n1; n1 = n2; n2 = tmp; V = -V; }
-        elements.push({ id: elements.length, type: ELEMENT_TYPES.TET4, nodes: [n0, n1, n2, n3], volume: V });
+        if (V < -1e-15) { const tmp = n1; n1 = n2; n2 = tmp; V = -V; }
+        if (V > 1e-15 && Number.isFinite(V)) {
+          elements.push({ id: elements.length, type: ELEMENT_TYPES.TET4, nodes: [n0, n1, n2, n3], volume: V });
+        }
       }
     }
 
@@ -410,7 +418,21 @@ export class FEAEngine {
   }
 
   computeTet4Stiffness(nodeCoords, E, nu) {
-    const [p1, p2, p3, p4] = nodeCoords;
+    if (!nodeCoords || nodeCoords.length < 4) return null;
+    let [p1, p2, p3, p4] = nodeCoords;
+    if (!p1 || !p2 || !p3 || !p4) return null;
+
+    let volume = this._computeTetVolume([p1, p2, p3, p4]);
+    if (!Number.isFinite(volume) || Math.abs(volume) <= 1e-15) return null;
+
+    // If tet is inverted, swap p2 and p3 to repair orientation so determinant > 0
+    if (volume < 0) {
+      const tmp = p2;
+      p2 = p3;
+      p3 = tmp;
+      volume = -volume;
+    }
+
     const M = [
       [1, p1[0], p1[1], p1[2]],
       [1, p2[0], p2[1], p2[2]],
@@ -420,9 +442,6 @@ export class FEAEngine {
 
     const Minv = this._invert4x4(M);
     if (!Minv) return null;
-
-    const volume = this._computeTetVolume(nodeCoords);
-    if (volume <= 0) return null;
 
     const beta = Minv[1];
     const gamma = Minv[2];
@@ -445,14 +464,19 @@ export class FEAEngine {
       B[5][col + 2] = beta[i];
     }
 
-    const C = E / ((1 + nu) * (1 - 2 * nu));
+    // Guard Poisson's ratio against singularity at ν = 0.5 (incompressible materials) and ν = -1
+    const safeNu = Math.max(-0.999, Math.min(0.4999, Number(nu) !== undefined && !Number.isNaN(nu) ? nu : 0.3));
+    const safeE = Math.max(1e-6, Number(E) || 200e9);
+    const denom = (1 + safeNu) * (1 - 2 * safeNu);
+    const C = (safeE / Math.max(1e-12, Math.abs(denom))) * Math.sign(denom || 1);
+
     const D = Array.from({ length: 6 }, () => new Float64Array(6));
-    D[0][0] = C * (1 - nu); D[0][1] = C * nu;     D[0][2] = C * nu;
-    D[1][0] = C * nu;     D[1][1] = C * (1 - nu); D[1][2] = C * nu;
-    D[2][0] = C * nu;     D[2][1] = C * nu;     D[2][2] = C * (1 - nu);
-    D[3][3] = (C * (1 - 2 * nu)) / 2;
-    D[4][4] = (C * (1 - 2 * nu)) / 2;
-    D[5][5] = (C * (1 - 2 * nu)) / 2;
+    D[0][0] = C * (1 - safeNu); D[0][1] = C * safeNu;     D[0][2] = C * safeNu;
+    D[1][0] = C * safeNu;     D[1][1] = C * (1 - safeNu); D[1][2] = C * safeNu;
+    D[2][0] = C * safeNu;     D[2][1] = C * safeNu;     D[2][2] = C * (1 - safeNu);
+    D[3][3] = (C * (1 - 2 * safeNu)) / 2;
+    D[4][4] = (C * (1 - 2 * safeNu)) / 2;
+    D[5][5] = (C * (1 - 2 * safeNu)) / 2;
 
     const DB = Array.from({ length: 6 }, () => new Float64Array(12));
     for (let r = 0; r < 6; r++) {
@@ -480,6 +504,7 @@ export class FEAEngine {
   }
 
   _invert4x4(M) {
+    if (!M || M.length !== 4) return null;
     const A = M.map(row => [...row]);
     const n = 4;
     const I = Array.from({ length: n }, (_, i) => {
@@ -497,7 +522,7 @@ export class FEAEngine {
           pivotRow = r;
         }
       }
-      if (Math.abs(pivot) < 1e-25) return null;
+      if (!Number.isFinite(pivot) || Math.abs(pivot) < 1e-25) return null;
 
       if (pivotRow !== i) {
         [A[i], A[pivotRow]] = [A[pivotRow], A[i]];
@@ -518,43 +543,63 @@ export class FEAEngine {
         }
       }
     }
+
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        if (!Number.isFinite(I[r][c])) return null;
+      }
+    }
+
     return I;
   }
 
   _solvePCG(K, F, maxIter = 2500, tol = 1e-7) {
     const n = F.length;
     const U = new Float64Array(n);
+    if (n === 0) return U;
+
     const r = new Float64Array(n);
     const z = new Float64Array(n);
     const p = new Float64Array(n);
     const Kp = new Float64Array(n);
 
+    const safeMaxIter = Math.max(10, Math.min(100000, Number(maxIter) || 2500));
+    const safeTol = Math.max(1e-15, Number(tol) || 1e-7);
+
+    // Diagonal preconditioner (Jacobi)
     const M = new Float64Array(n);
     for (let i = 0; i < n; i++) {
-      const diag = K.rows[i].get(i) || 1.0;
-      M[i] = Math.abs(diag) > 1e-12 ? 1.0 / diag : 1.0;
+      const diag = K.rows[i]?.get(i) || 1.0;
+      M[i] = (Number.isFinite(diag) && Math.abs(diag) > 1e-12) ? 1.0 / diag : 1.0;
     }
 
     let normF = 0;
     for (let i = 0; i < n; i++) {
-      r[i] = F[i];
-      normF += F[i] * F[i];
-      z[i] = M[i] * r[i];
+      const fi = Number.isFinite(F[i]) ? F[i] : 0;
+      r[i] = fi;
+      normF += fi * fi;
+      z[i] = M[i] * fi;
       p[i] = z[i];
     }
     normF = Math.sqrt(normF);
+    // Early exit on zero residual ||r|| ~ 0 or zero external load
     if (normF < 1e-15) return U;
 
     let rzOld = 0;
     for (let i = 0; i < n; i++) rzOld += r[i] * z[i];
+    if (Math.abs(rzOld) < 1e-30 || !Number.isFinite(rzOld)) return U;
 
-    for (let iter = 0; iter < maxIter; iter++) {
+    for (let iter = 0; iter < safeMaxIter; iter++) {
       K.mult(p, Kp);
       let pKp = 0;
       for (let i = 0; i < n; i++) pKp += p[i] * Kp[i];
-      if (Math.abs(pKp) < 1e-25) break;
+
+      // Safeguard against breakdown when matrix is ill-conditioned or singular
+      if (!Number.isFinite(pKp) || Math.abs(pKp) < 1e-25) break;
 
       const alpha = rzOld / pKp;
+      if (!Number.isFinite(alpha)) break;
+
       for (let i = 0; i < n; i++) {
         U[i] += alpha * p[i];
         r[i] -= alpha * Kp[i];
@@ -564,32 +609,59 @@ export class FEAEngine {
       for (let i = 0; i < n; i++) normR += r[i] * r[i];
       normR = Math.sqrt(normR);
 
-      if (normR / normF < tol) break;
+      // Early exit on zero residual ||r|| ~ 0 or convergence to tolerance
+      if (normR < 1e-15 || (normR / (normF || 1.0)) < safeTol) break;
 
       for (let i = 0; i < n; i++) z[i] = M[i] * r[i];
       let rzNew = 0;
       for (let i = 0; i < n; i++) rzNew += r[i] * z[i];
 
+      if (Math.abs(rzOld) < 1e-30 || !Number.isFinite(rzNew)) break;
+
       const beta = rzNew / rzOld;
+      if (!Number.isFinite(beta)) break;
+
       rzOld = rzNew;
       for (let i = 0; i < n; i++) {
         p[i] = z[i] + beta * p[i];
       }
     }
+
+    // Sanitize output displacements against NaNs or Infinities
+    for (let i = 0; i < n; i++) {
+      if (!Number.isFinite(U[i])) U[i] = 0;
+    }
+
     return U;
   }
 
   computeStressTensor(element, displacements, E, nu) {
     const nodes = element.nodes.slice(0, 4);
     const nodeCoords = nodes.map(nIdx => this.solidMesh.nodes[nIdx].posMeters);
-    const { B, D } = this.computeTet4Stiffness(nodeCoords, E, nu);
+    const stiffnessRes = this.computeTet4Stiffness(nodeCoords, E, nu);
+
+    if (!stiffnessRes) {
+      return {
+        strain: new Float64Array(6),
+        stress: new Float64Array(6),
+        cauchyTensor: [
+          [0, 0, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+        principalStresses: [0, 0, 0],
+        vonMises: 0,
+      };
+    }
+
+    const { B, D } = stiffnessRes;
 
     const uElem = new Float64Array(12);
     for (let i = 0; i < 4; i++) {
       const nIdx = nodes[i];
-      uElem[i * 3] = displacements[nIdx * 3];
-      uElem[i * 3 + 1] = displacements[nIdx * 3 + 1];
-      uElem[i * 3 + 2] = displacements[nIdx * 3 + 2];
+      uElem[i * 3] = displacements[nIdx * 3] || 0;
+      uElem[i * 3 + 1] = displacements[nIdx * 3 + 1] || 0;
+      uElem[i * 3 + 2] = displacements[nIdx * 3 + 2] || 0;
     }
 
     const strain = new Float64Array(6);
@@ -924,43 +996,66 @@ export class FEAEngine {
   }
 
   _createDeformedGeometry(nodes, boundaryFaces, displacementVectors, nodalVonMisesMPa, minStressMPa, maxStressMPa) {
+    const geom = new THREE.BufferGeometry();
+    if (!boundaryFaces || boundaryFaces.length === 0 || !nodes || nodes.length === 0) {
+      geom.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+      geom.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
+      geom.setAttribute('normal', new THREE.Float32BufferAttribute([], 3));
+      return geom;
+    }
+
     const positions = [];
     const colors = [];
     const normals = [];
 
-    const stressRange = Math.max(1e-4, maxStressMPa - minStressMPa);
+    const safeMin = Number.isFinite(minStressMPa) ? minStressMPa : 0;
+    const safeMax = Number.isFinite(maxStressMPa) ? maxStressMPa : 0;
+    const stressRange = Math.max(1e-4, safeMax - safeMin);
 
     let maxDisp = 0;
-    for (const v of displacementVectors) {
-      const l = v.length();
-      if (l > maxDisp) maxDisp = l;
+    if (displacementVectors) {
+      for (const v of displacementVectors) {
+        if (v) {
+          const l = v.length();
+          if (l > maxDisp && Number.isFinite(l)) maxDisp = l;
+        }
+      }
     }
     const scale = maxDisp > 1e-12 ? 0.05 / maxDisp : 1.0;
 
     for (const face of boundaryFaces) {
+      if (!face.nodes || face.nodes.length < 3) continue;
       const [i1, i2, i3] = face.nodes;
       const n1 = nodes[i1];
       const n2 = nodes[i2];
       const n3 = nodes[i3];
+      if (!n1 || !n2 || !n3) continue;
 
-      const p1 = new THREE.Vector3().copy(n1.point).addScaledVector(displacementVectors[i1], scale * 1000);
-      const p2 = new THREE.Vector3().copy(n2.point).addScaledVector(displacementVectors[i2], scale * 1000);
-      const p3 = new THREE.Vector3().copy(n3.point).addScaledVector(displacementVectors[i3], scale * 1000);
+      const d1 = displacementVectors?.[i1] || new THREE.Vector3();
+      const d2 = displacementVectors?.[i2] || new THREE.Vector3();
+      const d3 = displacementVectors?.[i3] || new THREE.Vector3();
+
+      const p1 = new THREE.Vector3().copy(n1.point).addScaledVector(d1, scale * 1000);
+      const p2 = new THREE.Vector3().copy(n2.point).addScaledVector(d2, scale * 1000);
+      const p3 = new THREE.Vector3().copy(n3.point).addScaledVector(d3, scale * 1000);
 
       const u = new THREE.Vector3().subVectors(p2, p1);
       const v = new THREE.Vector3().subVectors(p3, p1);
       const norm = new THREE.Vector3().crossVectors(u, v).normalize();
 
-      const c1 = this._stressToColor((nodalVonMisesMPa[i1] - minStressMPa) / stressRange);
-      const c2 = this._stressToColor((nodalVonMisesMPa[i2] - minStressMPa) / stressRange);
-      const c3 = this._stressToColor((nodalVonMisesMPa[i3] - minStressMPa) / stressRange);
+      const s1 = nodalVonMisesMPa?.[i1] ?? safeMin;
+      const s2 = nodalVonMisesMPa?.[i2] ?? safeMin;
+      const s3 = nodalVonMisesMPa?.[i3] ?? safeMin;
+
+      const c1 = this._stressToColor((s1 - safeMin) / stressRange);
+      const c2 = this._stressToColor((s2 - safeMin) / stressRange);
+      const c3 = this._stressToColor((s3 - safeMin) / stressRange);
 
       positions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
       colors.push(c1[0], c1[1], c1[2], c2[0], c2[1], c2[2], c3[0], c3[1], c3[2]);
       normals.push(norm.x, norm.y, norm.z, norm.x, norm.y, norm.z, norm.x, norm.y, norm.z);
     }
 
-    const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
     geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
@@ -990,9 +1085,12 @@ export class FEAEngine {
     if (!geometry) return null;
 
     geometry.computeBoundingBox();
-    const box = geometry.boundingBox;
+    const box = geometry.boundingBox || new THREE.Box3(new THREE.Vector3(-10, -10, -10), new THREE.Vector3(10, 10, 10));
     const size = new THREE.Vector3();
     box.getSize(size);
+    if (!Number.isFinite(size.x) || size.x <= 0) size.x = 10;
+    if (!Number.isFinite(size.y) || size.y <= 0) size.y = 10;
+    if (!Number.isFinite(size.z) || size.z <= 0) size.z = 10;
 
     let axis = 'x';
     let length = size.x;

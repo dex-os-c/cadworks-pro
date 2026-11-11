@@ -26,7 +26,7 @@ export class ExportEngine {
 
     const posAttr = geom.getAttribute('position');
     const normalAttr = geom.getAttribute('normal');
-    const numTriangles = Math.floor(posAttr.count / 3);
+    const numTriangles = posAttr ? Math.floor(posAttr.count / 3) : 0;
 
     if (binary) {
       const bufferLength = 84 + numTriangles * 50;
@@ -42,66 +42,81 @@ export class ExportEngine {
       writer.setUint32(80, numTriangles, true);
 
       let offset = 84;
-      for (let i = 0; i < posAttr.count; i += 3) {
-        // Compute or retrieve facet normal
-        let nx = normalAttr ? normalAttr.getX(i) : 0;
-        let ny = normalAttr ? normalAttr.getY(i) : 0;
-        let nz = normalAttr ? normalAttr.getZ(i) : 1;
+      if (posAttr && posAttr.count >= 3) {
+        for (let i = 0; i < posAttr.count; i += 3) {
+          // Compute or retrieve facet normal
+          let nx = normalAttr ? normalAttr.getX(i) : 0;
+          let ny = normalAttr ? normalAttr.getY(i) : 0;
+          let nz = normalAttr ? normalAttr.getZ(i) : 1;
 
-        // If normal is zero or degenerate, calculate face normal from 3 vertices
-        if (Math.abs(nx) < 1e-7 && Math.abs(ny) < 1e-7 && Math.abs(nz) < 1e-7) {
-          const v0 = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-          const v1 = new THREE.Vector3(posAttr.getX(i + 1), posAttr.getY(i + 1), posAttr.getZ(i + 1));
-          const v2 = new THREE.Vector3(posAttr.getX(i + 2), posAttr.getY(i + 2), posAttr.getZ(i + 2));
-          const fn = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
-          nx = fn.x;
-          ny = fn.y;
-          nz = fn.z;
+          if (isNaN(nx) || !isFinite(nx)) nx = 0;
+          if (isNaN(ny) || !isFinite(ny)) ny = 0;
+          if (isNaN(nz) || !isFinite(nz)) nz = 1;
+
+          // If normal is zero or degenerate, calculate face normal from 3 vertices
+          if (Math.abs(nx) < 1e-7 && Math.abs(ny) < 1e-7 && Math.abs(nz) < 1e-7) {
+            const v0 = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+            const v1 = new THREE.Vector3(posAttr.getX(i + 1), posAttr.getY(i + 1), posAttr.getZ(i + 1));
+            const v2 = new THREE.Vector3(posAttr.getX(i + 2), posAttr.getY(i + 2), posAttr.getZ(i + 2));
+            const fn = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
+            nx = isNaN(fn.x) ? 0 : fn.x;
+            ny = isNaN(fn.y) ? 0 : fn.y;
+            nz = isNaN(fn.z) ? 1 : fn.z;
+          }
+
+          writer.setFloat32(offset, nx, true); offset += 4;
+          writer.setFloat32(offset, ny, true); offset += 4;
+          writer.setFloat32(offset, nz, true); offset += 4;
+
+          // 3 Vertices
+          for (let v = 0; v < 3; v++) {
+            const vx = posAttr.getX(i + v);
+            const vy = posAttr.getY(i + v);
+            const vz = posAttr.getZ(i + v);
+            writer.setFloat32(offset, isNaN(vx) ? 0 : vx, true); offset += 4;
+            writer.setFloat32(offset, isNaN(vy) ? 0 : vy, true); offset += 4;
+            writer.setFloat32(offset, isNaN(vz) ? 0 : vz, true); offset += 4;
+          }
+
+          // Attribute byte count (0)
+          writer.setUint16(offset, 0, true); offset += 2;
         }
-
-        writer.setFloat32(offset, nx, true); offset += 4;
-        writer.setFloat32(offset, ny, true); offset += 4;
-        writer.setFloat32(offset, nz, true); offset += 4;
-
-        // 3 Vertices
-        for (let v = 0; v < 3; v++) {
-          writer.setFloat32(offset, posAttr.getX(i + v), true); offset += 4;
-          writer.setFloat32(offset, posAttr.getY(i + v), true); offset += 4;
-          writer.setFloat32(offset, posAttr.getZ(i + v), true); offset += 4;
-        }
-
-        // Attribute byte count (0)
-        writer.setUint16(offset, 0, true); offset += 2;
       }
 
       return new Blob([buffer], { type: 'application/sla' });
     } else {
       let stl = 'solid CADWorksModel\n';
-      for (let i = 0; i < posAttr.count; i += 3) {
-        let nx = normalAttr ? normalAttr.getX(i) : 0;
-        let ny = normalAttr ? normalAttr.getY(i) : 0;
-        let nz = normalAttr ? normalAttr.getZ(i) : 1;
+      if (posAttr && posAttr.count >= 3) {
+        for (let i = 0; i < posAttr.count; i += 3) {
+          let nx = normalAttr ? normalAttr.getX(i) : 0;
+          let ny = normalAttr ? normalAttr.getY(i) : 0;
+          let nz = normalAttr ? normalAttr.getZ(i) : 1;
 
-        if (Math.abs(nx) < 1e-7 && Math.abs(ny) < 1e-7 && Math.abs(nz) < 1e-7) {
-          const v0 = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-          const v1 = new THREE.Vector3(posAttr.getX(i + 1), posAttr.getY(i + 1), posAttr.getZ(i + 1));
-          const v2 = new THREE.Vector3(posAttr.getX(i + 2), posAttr.getY(i + 2), posAttr.getZ(i + 2));
-          const fn = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
-          nx = fn.x;
-          ny = fn.y;
-          nz = fn.z;
-        }
+          if (isNaN(nx) || !isFinite(nx)) nx = 0;
+          if (isNaN(ny) || !isFinite(ny)) ny = 0;
+          if (isNaN(nz) || !isFinite(nz)) nz = 1;
 
-        stl += `  facet normal ${nx.toFixed(6)} ${ny.toFixed(6)} ${nz.toFixed(6)}\n`;
-        stl += '    outer loop\n';
-        for (let v = 0; v < 3; v++) {
-          const x = posAttr.getX(i + v).toFixed(6);
-          const y = posAttr.getY(i + v).toFixed(6);
-          const z = posAttr.getZ(i + v).toFixed(6);
-          stl += `      vertex ${x} ${y} ${z}\n`;
+          if (Math.abs(nx) < 1e-7 && Math.abs(ny) < 1e-7 && Math.abs(nz) < 1e-7) {
+            const v0 = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+            const v1 = new THREE.Vector3(posAttr.getX(i + 1), posAttr.getY(i + 1), posAttr.getZ(i + 1));
+            const v2 = new THREE.Vector3(posAttr.getX(i + 2), posAttr.getY(i + 2), posAttr.getZ(i + 2));
+            const fn = new THREE.Vector3().subVectors(v1, v0).cross(new THREE.Vector3().subVectors(v2, v0)).normalize();
+            nx = isNaN(fn.x) ? 0 : fn.x;
+            ny = isNaN(fn.y) ? 0 : fn.y;
+            nz = isNaN(fn.z) ? 1 : fn.z;
+          }
+
+          stl += `  facet normal ${nx.toFixed(6)} ${ny.toFixed(6)} ${nz.toFixed(6)}\n`;
+          stl += '    outer loop\n';
+          for (let v = 0; v < 3; v++) {
+            const x = (isNaN(posAttr.getX(i + v)) ? 0 : posAttr.getX(i + v)).toFixed(6);
+            const y = (isNaN(posAttr.getY(i + v)) ? 0 : posAttr.getY(i + v)).toFixed(6);
+            const z = (isNaN(posAttr.getZ(i + v)) ? 0 : posAttr.getZ(i + v)).toFixed(6);
+            stl += `      vertex ${x} ${y} ${z}\n`;
+          }
+          stl += '    endloop\n';
+          stl += '  endfacet\n';
         }
-        stl += '    endloop\n';
-        stl += '  endfacet\n';
       }
       stl += 'endsolid CADWorksModel\n';
       return new Blob([stl], { type: 'text/plain' });
@@ -167,6 +182,14 @@ export class ExportEngine {
     if (version === 'R12' || version === 'AC1009') acadVer = 'AC1009';
     else if (version === '2018' || version === 'AC1032') acadVer = 'AC1032';
 
+    // Defensive coordinate formatting: handles negative decimals, zero without -0, and guards against NaNs
+    const formatCoord = (val) => {
+      const num = typeof val === 'number' ? val : parseFloat(val);
+      if (isNaN(num) || !isFinite(num)) return '0.0000';
+      const fixed = num.toFixed(4);
+      return (fixed === '-0.0000' || fixed === '-0') ? '0.0000' : fixed;
+    };
+
     let dxf = `0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\n${acadVer}\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n`;
     dxf += `0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n70\n1\n0\nLAYER\n2\n0\n70\n0\n62\n7\n6\nCONTINUOUS\n0\nENDTAB\n0\nENDSEC\n`;
     dxf += `0\nSECTION\n2\nENTITIES\n`;
@@ -177,34 +200,37 @@ export class ExportEngine {
       if (geom.index) geom = geom.toNonIndexed();
       const pos = geom.getAttribute('position');
 
-      for (let i = 0; i < pos.count; i += 3) {
-        const x1 = pos.getX(i).toFixed(4), y1 = pos.getY(i).toFixed(4), z1 = pos.getZ(i).toFixed(4);
-        const x2 = pos.getX(i + 1).toFixed(4), y2 = pos.getY(i + 1).toFixed(4), z2 = pos.getZ(i + 1).toFixed(4);
-        const x3 = pos.getX(i + 2).toFixed(4), y3 = pos.getY(i + 2).toFixed(4), z3 = pos.getZ(i + 2).toFixed(4);
+      if (pos && pos.count >= 3) {
+        for (let i = 0; i < pos.count; i += 3) {
+          const x1 = formatCoord(pos.getX(i)), y1 = formatCoord(pos.getY(i)), z1 = formatCoord(pos.getZ(i));
+          const x2 = formatCoord(pos.getX(i + 1)), y2 = formatCoord(pos.getY(i + 1)), z2 = formatCoord(pos.getZ(i + 1));
+          const x3 = formatCoord(pos.getX(i + 2)), y3 = formatCoord(pos.getY(i + 2)), z3 = formatCoord(pos.getZ(i + 2));
 
-        dxf += `0\n3DFACE\n8\n0\n`;
-        dxf += `10\n${x1}\n20\n${y1}\n30\n${z1}\n`;
-        dxf += `11\n${x2}\n21\n${y2}\n31\n${z2}\n`;
-        dxf += `12\n${x3}\n22\n${y3}\n32\n${z3}\n`;
-        dxf += `13\n${x3}\n23\n${y3}\n33\n${z3}\n`; // Quad face closed on 3rd vertex
+          dxf += `0\n3DFACE\n8\n0\n`;
+          dxf += `10\n${x1}\n20\n${y1}\n30\n${z1}\n`;
+          dxf += `11\n${x2}\n21\n${y2}\n31\n${z2}\n`;
+          dxf += `12\n${x3}\n22\n${y3}\n32\n${z3}\n`;
+          dxf += `13\n${x3}\n23\n${y3}\n33\n${z3}\n`; // Quad face closed on 3rd vertex
+        }
       }
     } else if (Array.isArray(entitiesOrGeometry)) {
       // 2D sketch entities
       for (const ent of entitiesOrGeometry) {
+        if (!ent) continue;
         if (ent.type === 'line' && ent.p1 && ent.p2) {
           dxf += `0\nLINE\n8\n0\n`;
-          dxf += `10\n${ent.p1.x}\n20\n${ent.p1.y}\n30\n${ent.p1.z || 0.0}\n`;
-          dxf += `11\n${ent.p2.x}\n21\n${ent.p2.y}\n31\n${ent.p2.z || 0.0}\n`;
+          dxf += `10\n${formatCoord(ent.p1.x)}\n20\n${formatCoord(ent.p1.y)}\n30\n${formatCoord(ent.p1.z || 0.0)}\n`;
+          dxf += `11\n${formatCoord(ent.p2.x)}\n21\n${formatCoord(ent.p2.y)}\n31\n${formatCoord(ent.p2.z || 0.0)}\n`;
         } else if (ent.type === 'circle' && ent.center) {
           dxf += `0\nCIRCLE\n8\n0\n`;
-          dxf += `10\n${ent.center.x}\n20\n${ent.center.y}\n30\n${ent.center.z || 0.0}\n`;
-          dxf += `40\n${ent.radius}\n`;
+          dxf += `10\n${formatCoord(ent.center.x)}\n20\n${formatCoord(ent.center.y)}\n30\n${formatCoord(ent.center.z || 0.0)}\n`;
+          dxf += `40\n${formatCoord(ent.radius || 10.0)}\n`;
         } else if (ent.type === 'arc' && ent.center) {
           dxf += `0\nARC\n8\n0\n`;
-          dxf += `10\n${ent.center.x}\n20\n${ent.center.y}\n30\n${ent.center.z || 0.0}\n`;
-          dxf += `40\n${ent.radius}\n`;
-          const sDeg = ((ent.startAngle || 0) * 180 / Math.PI).toFixed(4);
-          const eDeg = ((ent.endAngle || 0) * 180 / Math.PI).toFixed(4);
+          dxf += `10\n${formatCoord(ent.center.x)}\n20\n${formatCoord(ent.center.y)}\n30\n${formatCoord(ent.center.z || 0.0)}\n`;
+          dxf += `40\n${formatCoord(ent.radius || 10.0)}\n`;
+          const sDeg = formatCoord(((ent.startAngle || 0) * 180) / Math.PI);
+          const eDeg = formatCoord(((ent.endAngle || 0) * 180) / Math.PI);
           dxf += `50\n${sDeg}\n51\n${eDeg}\n`;
         } else if (ent.type === 'rect' && ent.p1 && ent.p2) {
           // Closed 4-line rectangle
@@ -217,12 +243,12 @@ export class ExportEngine {
           for (let k = 0; k < 4; k++) {
             const next = pts[(k + 1) % 4];
             dxf += `0\nLINE\n8\n0\n`;
-            dxf += `10\n${pts[k].x}\n20\n${pts[k].y}\n30\n0.0\n`;
-            dxf += `11\n${next.x}\n21\n${next.y}\n31\n0.0\n`;
+            dxf += `10\n${formatCoord(pts[k].x)}\n20\n${formatCoord(pts[k].y)}\n30\n0.0000\n`;
+            dxf += `11\n${formatCoord(next.x)}\n21\n${formatCoord(next.y)}\n31\n0.0000\n`;
           }
         } else if (ent.type === 'point' && ent.x !== undefined) {
           dxf += `0\nPOINT\n8\n0\n`;
-          dxf += `10\n${ent.x}\n20\n${ent.y}\n30\n${ent.z || 0.0}\n`;
+          dxf += `10\n${formatCoord(ent.x)}\n20\n${formatCoord(ent.y)}\n30\n${formatCoord(ent.z || 0.0)}\n`;
         }
       }
     }
@@ -251,8 +277,10 @@ export class ExportEngine {
 
     const pos = geom.getAttribute('position');
     const normal = geom.getAttribute('normal');
-    const timestamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0];
+    // Standard ISO 8601 timestamp in STEP Part 21 (YYYY-MM-DDTHH:MM:SS)
+    const timestamp = new Date().toISOString().slice(0, 19);
     const schema = options.schema === 'AP214' ? 'AUTOMOTIVE_DESIGN' : 'AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF';
+    const safeModelName = String(modelName || 'CADWORKS_PART').replace(/[^a-zA-Z0-9_-]/g, '_');
 
     // Color: Steel / Teal accent by default, or customizable
     const colorR = options.colorR !== undefined ? options.colorR : 0.22;
@@ -262,7 +290,7 @@ export class ExportEngine {
     let step = `ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION(('CADWorks Pro High-Fidelity Solid B-Rep STEP Export', '3D Mechanical Solid Model', 'CAX-IF Rec.Pracs. Solid B-Rep'), '2;1');
-FILE_NAME('${modelName}.stp', '${timestamp}', ('Mechanical Engineer'), ('CADWorks Pro Engineering'), 'CADWorks Pro Kernel 2.0', 'CADWorks Pro AP214/AP242 Exporter', '');
+FILE_NAME('${safeModelName}.stp', '${timestamp}', ('Mechanical Engineer'), ('CADWorks Pro Engineering'), 'CADWorks Pro Kernel 2.0', 'CADWorks Pro AP214/AP242 Exporter', '');
 FILE_SCHEMA(('${schema}'));
 ENDSEC;
 
@@ -270,25 +298,25 @@ DATA;
 #1=APPLICATION_CONTEXT('core data for automotive and aerospace mechanical design processes');
 #2=APPLICATION_PROTOCOL_DEFINITION('international standard','${schema.toLowerCase()}',2020,#1);
 #3=PRODUCT_CONTEXT('part definition context',#1,'mechanical');
-#4=PRODUCT('${modelName}','${modelName}','Solid B-Rep Part',(#3));
+#4=PRODUCT('${safeModelName}','${safeModelName}','Solid B-Rep Part',(#3));
 #5=PRODUCT_DEFINITION_FORMATION('1.0','Initial Release',#4);
 #6=PRODUCT_DEFINITION('design','Mechanical CAD Solid Model',#5,#3);
-#7=PRODUCT_DEFINITION_SHAPE('${modelName}_SHAPE','Part 3D Shape Description',#6);
+#7=PRODUCT_DEFINITION_SHAPE('${safeModelName}_SHAPE','Part 3D Shape Description',#6);
 #8=SHAPE_DEFINITION_REPRESENTATION(#7,#9);
-#9=ADVANCED_BREP_SHAPE_REPRESENTATION('${modelName}_BREP_REP',(#10,#11),#12);
+#9=ADVANCED_BREP_SHAPE_REPRESENTATION('${safeModelName}_BREP_REP',(#10,#11),#12);
 #10=AXIS2_PLACEMENT_3D('Origin Placement',#13,#14,#15);
-#11=MANIFOLD_SOLID_BREP('${modelName}_SOLID',#16);
+#11=MANIFOLD_SOLID_BREP('${safeModelName}_SOLID',#16);
 #12=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#17)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#18,#19,#20)) REPRESENTATION_CONTEXT('3D Context','Mechanical'));
 #13=CARTESIAN_POINT('Origin Coordinates',(0.,0.,0.));
 #14=DIRECTION('Z Vector Axis',(0.,0.,1.));
 #15=DIRECTION('X Vector Axis',(1.,0.,0.));
-#16=CLOSED_SHELL('${modelName}_SHELL',(`;
+#16=CLOSED_SHELL('${safeModelName}_SHELL',(`;
 
     let entityId = 30;
     const faceIds = [];
 
     // Group triangles or export bounded planar faces
-    const numTriangles = Math.min(pos.count / 3, options.maxFaces || 1200);
+    const numTriangles = pos ? Math.min(Math.floor(pos.count / 3), options.maxFaces || 1200) : 0;
 
     let entitiesBuffer = '';
 
@@ -299,9 +327,15 @@ DATA;
       const cp1 = entityId++;
       const cp2 = entityId++;
       const cp3 = entityId++;
-      const x1 = pos.getX(i).toFixed(4), y1 = pos.getY(i).toFixed(4), z1 = pos.getZ(i).toFixed(4);
-      const x2 = pos.getX(i + 1).toFixed(4), y2 = pos.getY(i + 1).toFixed(4), z2 = pos.getZ(i + 1).toFixed(4);
-      const x3 = pos.getX(i + 2).toFixed(4), y3 = pos.getY(i + 2).toFixed(4), z3 = pos.getZ(i + 2).toFixed(4);
+      const x1 = (isNaN(pos.getX(i)) ? 0 : pos.getX(i)).toFixed(4);
+      const y1 = (isNaN(pos.getY(i)) ? 0 : pos.getY(i)).toFixed(4);
+      const z1 = (isNaN(pos.getZ(i)) ? 0 : pos.getZ(i)).toFixed(4);
+      const x2 = (isNaN(pos.getX(i + 1)) ? 0 : pos.getX(i + 1)).toFixed(4);
+      const y2 = (isNaN(pos.getY(i + 1)) ? 0 : pos.getY(i + 1)).toFixed(4);
+      const z2 = (isNaN(pos.getZ(i + 1)) ? 0 : pos.getZ(i + 1)).toFixed(4);
+      const x3 = (isNaN(pos.getX(i + 2)) ? 0 : pos.getX(i + 2)).toFixed(4);
+      const y3 = (isNaN(pos.getY(i + 2)) ? 0 : pos.getY(i + 2)).toFixed(4);
+      const z3 = (isNaN(pos.getZ(i + 2)) ? 0 : pos.getZ(i + 2)).toFixed(4);
 
       entitiesBuffer += `#${cp1}=CARTESIAN_POINT('',(${x1},${y1},${z1}));\n`;
       entitiesBuffer += `#${cp2}=CARTESIAN_POINT('',(${x2},${y2},${z2}));\n`;
@@ -352,15 +386,20 @@ DATA;
       entitiesBuffer += `#${boundId}=FACE_OUTER_BOUND('',#${loopId},.T.);\n`;
 
       // Surface Normal & Axis Placement for Geometric Plane Surface
-      const nx = normal ? normal.getX(i).toFixed(4) : '0.';
-      const ny = normal ? normal.getY(i).toFixed(4) : '0.';
-      const nz = normal ? normal.getZ(i).toFixed(4) : '1.';
+      const nxVal = normal ? normal.getX(i) : 0;
+      const nyVal = normal ? normal.getY(i) : 0;
+      const nzVal = normal ? normal.getZ(i) : 1;
+      const nx = (isNaN(nxVal) || !isFinite(nxVal) ? 0 : nxVal).toFixed(4);
+      const ny = (isNaN(nyVal) || !isFinite(nyVal) ? 0 : nyVal).toFixed(4);
+      const nz = (isNaN(nzVal) || !isFinite(nzVal) ? 1 : nzVal).toFixed(4);
 
       const normDir = entityId++;
       const axisPlace = entityId++;
       const planeSurf = entityId++;
       entitiesBuffer += `#${normDir}=DIRECTION('FaceNormal',(${nx},${ny},${nz}));\n`;
-      entitiesBuffer += `#${axisPlace}=AXIS2_PLACEMENT_3D('FacePlacement',#${cp1},#${normDir},#15);\n`;
+      // In STEP AXIS2_PLACEMENT_3D, ref direction cannot be parallel/colinear to normal axis
+      const refDirId = Math.abs(parseFloat(nx)) > 0.85 ? '#21' : '#15';
+      entitiesBuffer += `#${axisPlace}=AXIS2_PLACEMENT_3D('FacePlacement',#${cp1},#${normDir},${refDirId});\n`;
       entitiesBuffer += `#${planeSurf}=PLANE('PlanarSurface',#${axisPlace});\n`;
 
       // ADVANCED_FACE
@@ -369,11 +408,12 @@ DATA;
       faceIds.push(`#${faceId}`);
     }
 
-    step += faceIds.join(',') + '));\n';
+    step += (faceIds.length > 0 ? faceIds.join(',') : '') + '));\n';
     step += `#17=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-05),#18,'distance_accuracy_value','Solid Tolerance');\n`;
     step += `#18=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));\n`;
     step += `#19=(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.));\n`;
     step += `#20=(NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT());\n`;
+    step += `#21=DIRECTION('Y Vector Axis',(0.,1.,0.));\n`;
 
     // Append B-Rep entities
     step += entitiesBuffer;
@@ -429,12 +469,12 @@ DATA;
 
     const pos = geom.getAttribute('position');
     const normal = geom.getAttribute('normal');
-    const numTriangles = Math.min(pos.count / 3, options.maxFaces || 800);
+    const numTriangles = pos ? Math.min(Math.floor(pos.count / 3), options.maxFaces || 800) : 0;
 
-    // Helpers for IGES 80-column fixed card formatting
-    const padRight = (str, len) => (str + ' '.repeat(len)).substring(0, len);
-    const padLeft = (str, len) => (' '.repeat(len) + str).substring(str.length);
-    const formatSeq = (type, seq) => type + padLeft(String(seq), 7);
+    // Helpers for IGES 80-column fixed card formatting (strict 80 characters per line)
+    const padRight = (str, len) => String(str ?? '').padEnd(len, ' ').substring(0, len);
+    const padLeft = (str, len) => String(str ?? '').padStart(len, ' ').substring(0, len);
+    const formatSeq = (type, seq) => type + String(seq).padStart(7, ' ').substring(0, 7);
 
     let startLines = [];
     let globalLines = [];
@@ -485,7 +525,7 @@ DATA;
         pOffset += 64;
       }
 
-      // 2 D-cards (each 80 columns)
+      // 2 D-cards (each exactly 80 columns)
       // Line 1: Type(8) Ptr(8) Struct(8) Font(8) Level(8) View(8) Trans(8) LabelDisp(8) Status(8) D#
       const d1 = padLeft(String(type), 8) +
                  padLeft(String(paramStart), 8) +
